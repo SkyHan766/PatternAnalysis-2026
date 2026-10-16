@@ -44,5 +44,4 @@ The experiment ran on an NVIDIA A100-SXM4-40GB GPU. The binary-classifier versio
 This experiment demonstrates that ImageNet-pretrained ConvNeXt-Tiny, after replacing its classifier and fine-tuning on ADNI MRI images, exceeded the test-accuracy target. It does not establish that ConvNeXt is better than a standard CNN baseline, because the baseline has not yet been evaluated. It also does not satisfy the tutor's restriction on pretrained models. The final compliant comparison must therefore use ConvNeXt-Tiny initialised with weights=None and the ordinary CNN baseline on the same participant-level split, then compare their test metrics and resource costs.
 
 ## 当前报告能支持的结论
-
-预训练 ConvNeXt-Tiny 在这次测试集上达到了 86.04% 图像级准确率和 89.22% 患者级准确率，都高于 0.80。报告同时说明了患者级结果、误判、训练中的过拟合迹象和当前尚未完成的 baseline 与资源比较。它记录的是已完成的预训练实验；最终符合 tutor 要求的结果仍需使用从零初始化的 ConvNeXt 和普通 CNN baseline。
+预训练 ConvNeXt-Tiny 在这次测试集上达到了 86.04% 图像级准确率和 89.22% 患者级准确率，都高于 0.80
