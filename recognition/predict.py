@@ -1,4 +1,6 @@
+
 import argparse
+import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -10,6 +12,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    precision_recall_fscore_support,
     recall_score,
     roc_auc_score,
 )
@@ -23,71 +26,53 @@ from dataset import (
     create_dataloaders,
     prepare_data,
 )
-from modules import build_model, get_device
+from modules import build_model, count_parameters, get_device
 
 
 def select_best_checkpoint(
     model,
     device,
+    model_name: str,
     output_dir: Path,
 ) -> tuple[Path, dict]:
-    """
-    在分类头阶段和微调阶段的最佳 checkpoint 中，
-    选择 validation loss 较低者。
-    """
-    candidates = [
-        output_dir / "convnext_head_best.pt",
-        output_dir / "convnext_finetune_best.pt",
-    ]
+    """Load the selected validation-loss checkpoint for one architecture."""
+    checkpoint_path = output_dir / "best_model.pt"
 
-    for path in candidates:
-        if not path.exists():
-            raise FileNotFoundError(
-                f"找不到模型权重：{path}。"
-                "请先运行 train.py。"
-            )
-
-    checkpoint_infos = []
-
-    for path in candidates:
-        info = torch.load(
-            path,
-            map_location="cpu",
-            weights_only=True,
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}. "
+            f"Run train.py --model {model_name} first."
         )
 
-        print(
-            "Checkpoint:",
-            path.name,
-            "| stage:",
-            info["stage"],
-            "| epoch:",
-            info["epoch"],
-            "| validation loss:",
-            info["validation_loss"],
-        )
-
-        checkpoint_infos.append((path, info))
-
-    selected_path, selected_info = min(
-        checkpoint_infos,
-        key=lambda item: item[1]["validation_loss"],
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
     )
 
-    model.load_state_dict(selected_info["model_state"])
+    if checkpoint.get("model_name") != model_name:
+        raise ValueError(
+            f"Checkpoint architecture is {checkpoint.get('model_name')!r}, "
+            f"but requested {model_name!r}."
+        )
+
+    if checkpoint.get("pretrained") is not False:
+        raise ValueError(
+            "This checkpoint is not marked as trained from scratch. "
+            "Use a checkpoint created by the updated train.py."
+        )
+
+    model.load_state_dict(checkpoint["model_state"])
     model.to(device)
     model.eval()
 
-    print("\nSelected:", selected_path.name)
-    print("Stage:", selected_info["stage"])
-    print("Epoch:", selected_info["epoch"])
-    print(
-        "Saved validation loss:",
-        selected_info["validation_loss"],
-    )
+    print("\nSelected:", checkpoint_path.name)
+    print("Model:", checkpoint["model_name"])
+    print("Epoch:", checkpoint["epoch"])
+    print("Validation loss:", checkpoint["validation_loss"])
+    print("Trainable parameters:", f"{count_parameters(model):,}")
 
-    return selected_path, selected_info
-
+    return checkpoint_path, checkpoint
 
 def collect_predictions(
     model,
@@ -110,6 +95,10 @@ def collect_predictions(
     observed_subjects = []
 
     model.eval()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    inference_start = time.perf_counter()
 
     with torch.inference_mode():
         for images, labels, subject_ids in loader:
@@ -139,6 +128,18 @@ def collect_predictions(
             observed_subjects.extend(
                 list(subject_ids)
             )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    inference_seconds = time.perf_counter() - inference_start
+    if len(rows) > 0:
+        print(
+            f"Inference throughput: {inference_seconds / len(rows) * 1000:.3f} "
+            "ms/image (includes data loading)"
+        )
+    if device.type == "cuda":
+        peak_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        print(f"Peak allocated GPU memory during evaluation: {peak_memory_gb:.2f} GB")
 
     if len(probabilities) != len(rows):
         raise AssertionError(
@@ -227,32 +228,28 @@ def calculate_metrics(
     truth = rows["label"].astype(int)
     prediction = rows["pred_label"].astype(int)
 
+    class_precision, class_recall, class_f1, _ = (
+        precision_recall_fscore_support(
+            truth,
+            prediction,
+            labels=[0, 1],
+            zero_division=0,
+        )
+    )
+
     metrics = {
         "samples": len(rows),
-        "accuracy": accuracy_score(
-            truth,
-            prediction,
+        "accuracy": accuracy_score(truth, prediction),
+        "balanced_accuracy": balanced_accuracy_score(truth, prediction),
+        "nc_precision": class_precision[0],
+        "nc_recall": class_recall[0],
+        "ad_precision": class_precision[1],
+        "ad_recall": class_recall[1],
+        "macro_f1": f1_score(
+            truth, prediction, average="macro", zero_division=0
         ),
-        "balanced_accuracy": balanced_accuracy_score(
-            truth,
-            prediction,
-        ),
-        "ad_recall": recall_score(
-            truth,
-            prediction,
-            pos_label=1,
-            zero_division=0,
-        ),
-        "ad_f1": f1_score(
-            truth,
-            prediction,
-            pos_label=1,
-            zero_division=0,
-        ),
-        "roc_auc": roc_auc_score(
-            truth,
-            rows["prob_ad"],
-        ),
+        "ad_f1": class_f1[1],
+        "roc_auc": roc_auc_score(truth, rows["prob_ad"]),
     }
 
     matrix = confusion_matrix(
@@ -353,7 +350,7 @@ def save_result_figures(output_dir: Path) -> None:
         )
         axes[0].set(
             title="Loss by epoch",
-            xlabel="Epoch (1–2 head; 3–8 fine-tuning)",
+            xlabel="Epoch (from scratch)",
             ylabel="Loss",
         )
         axes[0].legend()
@@ -372,18 +369,12 @@ def save_result_figures(output_dir: Path) -> None:
         )
         axes[1].set(
             title="Accuracy by epoch",
-            xlabel="Epoch (1–2 head; 3–8 fine-tuning)",
+            xlabel="Epoch (from scratch)",
             ylabel="Accuracy",
         )
         axes[1].legend()
 
         for axis in axes:
-            axis.axvline(
-                2.5,
-                color="gray",
-                linestyle="--",
-                alpha=0.7,
-            )
             axis.grid(alpha=0.25)
 
         figure.tight_layout()
@@ -438,9 +429,15 @@ def save_result_figures(output_dir: Path) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate the trained ADNI ConvNeXt model."
+        description="Evaluate a from-scratch ADNI classification model."
     )
 
+    parser.add_argument(
+        "--model",
+        choices=["convnext", "baseline"],
+        default="convnext",
+        help="Architecture checkpoint to evaluate.",
+    )
     parser.add_argument(
         "--zip_path",
         type=Path,
@@ -497,11 +494,8 @@ def main():
     )
 
     device = get_device(require_cuda=True)
-
-    args.output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    model_output_dir = args.output_dir / args.model
+    model_output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = prepare_data(
         zip_path=args.zip_path,
@@ -511,23 +505,18 @@ def main():
         expected_rows=expected_rows,
     )
 
-    _train_loader, validation_loader, test_loader = (
-        create_dataloaders(
-            manifest=manifest,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-        )
+    _train_loader, validation_loader, test_loader = create_dataloaders(
+        manifest=manifest,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
 
-    model = build_model(
-        num_classes=2,
-        pretrained=False,
-    )
-
+    model = build_model(model_name=args.model, num_classes=2)
     select_best_checkpoint(
         model=model,
         device=device,
-        output_dir=args.output_dir,
+        model_name=args.model,
+        output_dir=model_output_dir,
     )
 
     if args.split in {"validation", "both"}:
@@ -536,7 +525,7 @@ def main():
             loader=validation_loader,
             split_name="validation",
             device=device,
-            output_dir=args.output_dir,
+            output_dir=model_output_dir,
         )
 
     if args.split in {"test", "both"}:
@@ -545,10 +534,10 @@ def main():
             loader=test_loader,
             split_name="test",
             device=device,
-            output_dir=args.output_dir,
+            output_dir=model_output_dir,
         )
 
-    save_result_figures(args.output_dir)
+    save_result_figures(model_output_dir)
 
 
 if __name__ == "__main__":

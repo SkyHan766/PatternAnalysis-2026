@@ -1,3 +1,4 @@
+
 import json
 import re
 import zipfile
@@ -33,15 +34,15 @@ DEFAULT_OUTPUT_DIR = Path(
 )
 
 
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+CHANNEL_MEAN = [0.5, 0.5, 0.5]
+CHANNEL_STD = [0.5, 0.5, 0.5]
 
 
 def get_transforms():
     """
     返回训练集和评估集的图像预处理。
 
-    MRI 灰度图复制成 3 个通道，以适配预训练 ConvNeXt。
+    MRI 灰度图复制成 3 个通道，供 ConvNeXt 和 CNN baseline 使用。
     验证集和测试集不使用随机增强。
     """
     train_transform = transforms.Compose([
@@ -58,8 +59,8 @@ def get_transforms():
         transforms.ToTensor(),
 
         transforms.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
+            mean=CHANNEL_MEAN,
+            std=CHANNEL_STD,
         ),
     ])
 
@@ -70,8 +71,8 @@ def get_transforms():
         transforms.ToTensor(),
 
         transforms.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
+            mean=CHANNEL_MEAN,
+            std=CHANNEL_STD,
         ),
     ])
 
@@ -573,8 +574,8 @@ def save_batch_preview(
 
     images, labels, subject_ids = next(iter(train_loader))
 
-    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    mean = torch.tensor(CHANNEL_MEAN).view(3, 1, 1)
+    std = torch.tensor(CHANNEL_STD).view(3, 1, 1)
 
     figure, axes = plt.subplots(2, 4, figsize=(12, 6))
 
