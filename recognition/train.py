@@ -93,14 +93,22 @@ def train_model(
     weight_decay,
     warmup_epochs,
     min_learning_rate,
+    label_smoothing,
 ):
     """Train all model parameters from scratch and save best validation loss."""
     if not 0 <= warmup_epochs < epochs:
         raise ValueError(
             "warmup_epochs must be at least 0 and smaller than epochs."
         )
+    if not 0.0 <= label_smoothing < 1.0:
+        raise ValueError("label_smoothing must be in the range [0, 1).")
 
-    criterion = nn.CrossEntropyLoss()
+    # Label smoothing is a training regularizer. Keep validation loss as
+    # standard cross-entropy so it remains comparable with earlier runs.
+    train_criterion = nn.CrossEntropyLoss(
+        label_smoothing=label_smoothing,
+    )
+    validation_criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -143,14 +151,14 @@ def train_model(
             model=model,
             loader=train_loader,
             device=device,
-            criterion=criterion,
+            criterion=train_criterion,
             optimizer=optimizer,
         )
         validation_metrics = run_one_epoch(
             model=model,
             loader=validation_loader,
             device=device,
-            criterion=criterion,
+            criterion=validation_criterion,
             optimizer=None,
         )
 
@@ -182,6 +190,7 @@ def train_model(
                     "weight_decay": weight_decay,
                     "warmup_epochs": warmup_epochs,
                     "min_learning_rate": min_learning_rate,
+                    "label_smoothing": label_smoothing,
                     "scheduler": "linear_warmup_then_cosine_decay",
                 },
                 checkpoint_path,
@@ -244,6 +253,12 @@ def parse_args():
         type=float,
         default=1e-6,
         help="Minimum learning rate reached by cosine decay.",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.1,
+        help="Label smoothing used for training loss only.",
     )
     parser.add_argument(
         "--expected_rows",
@@ -324,6 +339,7 @@ def main():
         f"Scheduler: linear warm-up for {args.warmup_epochs} epochs, "
         f"then cosine decay to {args.min_learning_rate}"
     )
+    print(f"Training label smoothing: {args.label_smoothing}")
     print(f"Epochs: {args.epochs} | pretrained weights: none")
 
     check_model_output(model, device, input_size=224)
@@ -345,6 +361,7 @@ def main():
         weight_decay=args.weight_decay,
         warmup_epochs=args.warmup_epochs,
         min_learning_rate=args.min_learning_rate,
+        label_smoothing=args.label_smoothing,
     )
 
     if device.type == "cuda":
