@@ -109,7 +109,7 @@ This experiment demonstrates that ImageNet-pretrained ConvNeXt-Tiny, after repla
 The results above are **training and image-level validation** outcomes only. They do **not** justify claims that the model's test-set or patient-level accuracy is below 0.80; such conclusions require formal evaluation of the corresponding checkpoints on the held-out test set.
 
 
-# Training Memo 3: ConvNeXt-Tiny with Warmup + Cosine Decay (From Scratch)
+## Training Memo 3: ConvNeXt-Tiny with Warmup + Cosine Decay (From Scratch)
 
 ## Experimental Setup
 
