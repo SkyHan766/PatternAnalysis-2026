@@ -107,3 +107,39 @@ This experiment demonstrates that ImageNet-pretrained ConvNeXt-Tiny, after repla
 ## Reporting Caution
 
 The results above are **training and image-level validation** outcomes only. They do **not** justify claims that the model's test-set or patient-level accuracy is below 0.80; such conclusions require formal evaluation of the corresponding checkpoints on the held-out test set.
+
+
+## Training Memo 3: ConvNeXt-Tiny with Warmup + Cosine Decay (From Scratch)
+
+## Experimental Setup
+
+- Model: ConvNeXt-Tiny, initialized from random weights (`weights=None`)
+- Data split: same participant-level split as previous runs
+- Optimizer: AdamW, base learning rate 0.001, weight decay 0.0001
+- Schedule: **2-step linear warmup** followed by **cosine decay** (new, relative to first 8-epoch run)
+- Epochs: 8
+- No new CNN baseline results in this round (ConvNeXt only)
+
+## Image-Level Validation Metrics
+
+| Metric | First 8-epoch (fixed LR) | 30-epoch (fixed LR) | This run (warmup + cosine) |
+|--------|------------------------|---------------------|----------------------------|
+| Lowest validation loss (epoch) | 0.5464 (epoch 2) | 0.5464 (epoch 2) | **0.5393 (epoch 3)** |
+| Highest validation accuracy (epoch) | 0.7468 (epoch 6) | 0.7507 (epoch 14) | 0.7340 (epoch 7) |
+| Best checkpoint saved (by val loss) | epoch 2 | epoch 2 | **epoch 3** |
+| Validation accuracy at best checkpoint | 0.7315 | 0.7315 | 0.7238 |
+| Training accuracy (final epoch) | 0.8310 | 0.9818 | 0.8839 |
+| Training time | 6.35 min | 23.19 min | 6.70 min |
+
+## Analysis
+
+- Compared to the first 8-epoch run, lowest validation loss **decreased by 0.0071** (0.5464 → 0.5393), but highest validation accuracy **dropped by 1.28 percentage points** (0.7468 → 0.7340).
+- The actual saved best checkpoint's validation accuracy also **decreased by 0.77 percentage points** (0.7315 → 0.7238).
+- Training accuracy reached 0.8839 by epoch 8, while final-epoch validation loss was 0.7585 and validation accuracy was 0.7229 — the gap between training and validation performance persists, indicating this schedule did not resolve generalization issues.
+- The 30-epoch fixed-LR experiment's best checkpoint also remained at epoch 2, supporting the earlier conclusion that **simply extending training does not solve the problem**.
+
+## Reportable Conclusions
+
+- In this single run, warmup + cosine decay **slightly reduced best image-level validation loss** but **did not improve validation accuracy** and **did not reach 0.80**.
+- This result evaluates the **combined effect** of warmup and cosine decay together; it cannot separately attribute effectiveness (or lack thereof) to either component.
+- Patient-level validation metrics are **not yet available**; no claim can be made about whether the patient-level target (≥ 0.80) is met based on these results alone.
