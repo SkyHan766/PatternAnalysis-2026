@@ -1,3 +1,4 @@
+
 import argparse
 import time
 from pathlib import Path
@@ -90,8 +91,15 @@ def train_model(
     epochs,
     learning_rate,
     weight_decay,
+    warmup_epochs,
+    min_learning_rate,
 ):
     """Train all model parameters from scratch and save best validation loss."""
+    if not 0 <= warmup_epochs < epochs:
+        raise ValueError(
+            "warmup_epochs must be at least 0 and smaller than epochs."
+        )
+
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -99,12 +107,38 @@ def train_model(
         weight_decay=weight_decay,
     )
 
+    cosine_epochs = epochs - warmup_epochs
+    if warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_epochs,
+            eta_min=min_learning_rate,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=min_learning_rate,
+        )
+
     checkpoint_path = output_dir / "best_model.pt"
     history_path = output_dir / "training_history.csv"
     history = []
     best_validation_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_metrics = run_one_epoch(
             model=model,
             loader=train_loader,
@@ -127,6 +161,7 @@ def train_model(
             "train_accuracy": train_metrics["accuracy"],
             "validation_loss": validation_metrics["loss"],
             "validation_accuracy": validation_metrics["accuracy"],
+            "learning_rate": epoch_learning_rate,
         })
         pd.DataFrame(history).to_csv(history_path, index=False)
 
@@ -144,6 +179,10 @@ def train_model(
                     "pretrained": False,
                     "parameter_count": count_parameters(model),
                     "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "warmup_epochs": warmup_epochs,
+                    "min_learning_rate": min_learning_rate,
+                    "scheduler": "linear_warmup_then_cosine_decay",
                 },
                 checkpoint_path,
             )
@@ -151,12 +190,14 @@ def train_model(
         saved_text = " | saved best" if improved else ""
         print(
             f"{model_name} | epoch {epoch}/{epochs} | "
+            f"lr {epoch_learning_rate:.7f} | "
             f"train loss {train_metrics['loss']:.4f}, "
             f"acc {train_metrics['accuracy']:.4f} | "
             f"val loss {validation_metrics['loss']:.4f}, "
             f"acc {validation_metrics['accuracy']:.4f}"
             f"{saved_text}"
         )
+        scheduler.step()
 
     return checkpoint_path, history_path
 
@@ -192,6 +233,18 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=2,
+        help="Number of initial epochs used for linear learning-rate warm-up.",
+    )
+    parser.add_argument(
+        "--min_learning_rate",
+        type=float,
+        default=1e-6,
+        help="Minimum learning rate reached by cosine decay.",
+    )
     parser.add_argument(
         "--expected_rows",
         type=int,
@@ -263,7 +316,14 @@ def main():
             "The two model parameter counts differ by more than 1%; "
             "review the baseline architecture before benchmarking."
         )
-    print(f"Optimizer: AdamW | learning rate: {args.learning_rate}")
+    print(
+        f"Optimizer: AdamW | base learning rate: {args.learning_rate} | "
+        f"weight decay: {args.weight_decay}"
+    )
+    print(
+        f"Scheduler: linear warm-up for {args.warmup_epochs} epochs, "
+        f"then cosine decay to {args.min_learning_rate}"
+    )
     print(f"Epochs: {args.epochs} | pretrained weights: none")
 
     check_model_output(model, device, input_size=224)
@@ -283,6 +343,8 @@ def main():
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
+        min_learning_rate=args.min_learning_rate,
     )
 
     if device.type == "cuda":
