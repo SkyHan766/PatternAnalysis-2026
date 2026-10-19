@@ -45,3 +45,65 @@ This experiment demonstrates that ImageNet-pretrained ConvNeXt-Tiny, after repla
 
 ## 当前报告能支持的结论
 预训练 ConvNeXt-Tiny 在这次测试集上达到了 86.04% 图像级准确率和 89.22% 患者级准确率，都高于 0.80
+
+# Training Memos: ConvNeXt-Tiny vs CNN Baseline (From Scratch)
+
+## Memo 1: First Formal Training (8 epochs)
+
+### Experimental Setup
+- Both **ConvNeXt-Tiny** and a **parameter-matched CNN baseline** were trained from random weight initialization (`weights=None`).
+- Shared configuration: same participant-level data split, AdamW optimizer, learning rate 0.001, 8 epochs.
+- Dataset: 30,520 image slices, 1,526 scans, 680 participants.
+- Split: 21,700 training / 4,320 validation / 4,500 test images (participant-level, no overlap).
+- Parameter count difference between the two models: **0.192%**.
+
+### Image-Level Results
+
+| Metric | ConvNeXt-Tiny | CNN Baseline |
+|--------|--------------|--------------|
+| Parameter count | 27,821,666 | 27,875,297 |
+| Lowest validation loss | 0.5464 (epoch 2) | 0.6906 (epoch 7) |
+| Highest validation accuracy | 0.7468 (epoch 6) | 0.7588 (epoch 7) |
+| Training accuracy (epoch 8) | 0.8310 | 0.8970 |
+| Validation accuracy (epoch 8) | 0.7306 | 0.7275 |
+| Training time | 6.35 min | 6.26 min |
+| Peak GPU memory allocated | 4.12 GB | 0.80 GB |
+
+### Preliminary Analysis
+- Both models' highest image-level validation accuracy was **below 0.80**.
+- CNN's peak accuracy was 1.20 percentage points higher than ConvNeXt's, but this is a single run and insufficient to conclude the CNN architecture is superior overall.
+- ConvNeXt achieved a lower minimum validation loss; its best checkpoint (selected by validation loss) came from **epoch 2**, not the highest-accuracy epoch 6.
+- CNN's best checkpoint came from **epoch 7**.
+- By epoch 8, training accuracy continued rising while validation accuracy fell below each model's peak, indicating **generalization did not improve** with further training.
+
+---
+
+## Memo 2: Second Training — Extended Epochs for ConvNeXt-Tiny
+
+### Strategy
+- ConvNeXt-Tiny initialized randomly; data split, AdamW, and learning rate (0.001) unchanged.
+- Only change: training epochs increased from **8 to 30**.
+- The first 8 epochs' logs are identical to Memo 1; lowest validation loss still at epoch 2 (0.5464).
+- Best checkpoint by validation loss therefore unchanged.
+
+### Results
+
+| Metric | 8 epochs | 30 epochs |
+|--------|----------|------------|
+| Highest image-level validation accuracy | 0.7468 (epoch 6) | 0.7507 (epoch 14) |
+| Training accuracy (final epoch) | 0.8310 | 0.9818 |
+| Validation loss (final epoch) | 0.7112 | 1.4096 |
+| Training time | 6.35 min | 23.19 min |
+
+### Analysis
+- Extending training improved highest image-level validation accuracy by only **0.39 percentage points**, still below 0.80.
+- Meanwhile, training accuracy reached **98.18%** and validation loss rose sharply, indicating **clear overfitting**.
+- Conclusion: simply increasing training epochs did not effectively improve generalization; insufficient training length was **not** the main limitation.
+- Next step: revert to 8 epochs and separately test **warmup** and **cosine decay** scheduling.
+- To conserve compute, the baseline was not re-run in this round.
+
+---
+
+## Reporting Caution
+
+The results above are **training and image-level validation** outcomes only. They do **not** justify claims that the model's test-set or patient-level accuracy is below 0.80; such conclusions require formal evaluation of the corresponding checkpoints on the held-out test set.
