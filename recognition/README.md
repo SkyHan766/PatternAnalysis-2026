@@ -197,3 +197,34 @@ The results above are **training and image-level validation** outcomes only. The
 - The persistent generalization gap across all LR variants (fixed, warmup+cosine, reduced) indicates **overfitting is the dominant issue**, not step-size selection.
 - Further hyperparameter tuning of learning rate alone is unlikely to reach the 0.80 target; **regularization (weight decay) and data representation** are more promising directions.
 - All results remain at the **image-level validation** stage; no claim about test-set or patient-level performance can be made until the best checkpoint is formally evaluated.
+
+
+## 2.5D Input Experiment Report
+
+## 1. Experimental Results
+
+### 中文版
+
+为引入相邻切片的空间信息，我们将 ConvNeXt-Tiny 的输入从“同一张灰度 MRI 切片复制为三个通道”改为“前一张、当前张、后一张切片分别作为三个通道”。模型仍从零训练，并保持患者级数据划分、学习率 0.001、权重衰减 0.0001 和 8 轮训练不变。按最低验证损失选取的最佳模型来自第 3 轮，验证损失为 0.5513。
+
+在默认分类阈值 0.5 下，2.5D 模型的图像、扫描和患者级验证准确率分别为 74.19%、78.24% 和 79.41%，高于原始单切片 ConvNeXt 的 73.15%、76.85% 和 74.51%。然而，患者级 AD recall 从 **78.79%（26/33）**降至 57.58%（19/33），患者级 balanced accuracy 也从 0.7563 降至 0.7372。因此，2.5D 提高了总体准确率，但默认阈值下漏掉了更多 AD 患者，不能认为它在所有指标上更优。
+
+作为后续验证集阈值探索，将 2.5D 的患者级阈值调至 0.39 时，患者准确率为 80.39%，AD recall 为 78.79%（26/33）；代价是 NC 误报从 7 人增加到 13 人。该阈值是根据验证集选择的，结果不能作为测试集表现。
+
+### English Version
+
+To incorporate spatial information, we replaced three copies of the same grayscale MRI slice with three adjacent slices—the previous, current, and next slices—as the input channels of ConvNeXt-Tiny. The model was trained from scratch using the same patient level split, learning rate (0.001), weight decay (0.0001), and eight-epoch schedule. The checkpoint with the lowest validation loss was obtained at epoch 3 (0.5513).
+
+At the default decision threshold of 0.5, the 2.5D model achieved 74.19% image level, 78.24% scan level, and 79.41% patient level validation accuracy, compared with 73.15%, 76.85%, and 74.51% for the original single-slice ConvNeXt. However, patient level AD recall decreased from 78.79% (26/33) to 57.58% (19/33), while patient level balanced accuracy decreased from 0.7563 to 0.7372. Thus, the gain in overall accuracy came with more missed AD patients at the default threshold.
+
+In an exploratory validation threshold analysis, setting the 2.5D patient level threshold to 0.39 produced 80.39% accuracy and 78.79% AD recall (26/33), while NC false positives increased from 7 to 13. This threshold was selected on the validation set; its performance must not be presented as a test result.
+
+---
+
+
+## 2. Summary
+
+- The 2.5D input experiment replaces channel duplication with adjacent-slice triplets to incorporate spatial context.
+- At default threshold (0.5), overall validation accuracy improved across all levels, but AD recall dropped substantially.
+- Threshold tuning on validation data can recover AD recall at the cost of more false positives; such tuning must not be applied to the test set.
+- Code changes are concentrated in `dataset.py` (data loading logic); `train.py` and `predict.py` received minor updates for compatibility and logging; `modules.py` is unchanged.
