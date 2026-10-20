@@ -143,3 +143,57 @@ The results above are **training and image-level validation** outcomes only. The
 - In this single run, warmup + cosine decay **slightly reduced best image-level validation loss** but **did not improve validation accuracy** and **did not reach 0.80**.
 - This result evaluates the **combined effect** of warmup and cosine decay together; it cannot separately attribute effectiveness (or lack thereof) to either component.
 - Patient-level validation metrics are **not yet available**; no claim can be made about whether the patient-level target (≥ 0.80) is met based on these results alone.
+
+- ## Training Memo 4: Fixed Learning Rate Comparison (0.001 vs 3e-4)
+
+## Experimental Setup
+
+- Model: ConvNeXt-Tiny, initialized from random weights (`weights=None`)
+- Data split: same participant-level split (21,700 train / 4,320 val / 4,500 test)
+- Optimizer: AdamW
+- Epochs: 8
+- Variables tested: **base learning rate only** (all other settings held constant)
+- Previous optimizations (warmup, cosine decay, label smoothing) were **removed** to isolate the effect of learning rate alone
+- No new CNN baseline results in this round
+
+## Results
+
+| Metric | LR = 0.001 (fixed) | LR = 3e-4 (fixed) | Change |
+|--------|-------------------|-------------------|--------|
+| Lowest validation loss (epoch) | 0.5464 (epoch 2) | 0.5497 (epoch 2) | +0.0033 |
+| Highest validation accuracy (epoch) | 0.7315 (epoch 2) | 0.7310 (epoch 2) | -0.0005 |
+| Training accuracy (epoch 2) | 0.6840 | — | — |
+| Training accuracy (epoch 8) | 0.8429 | — | — |
+| Validation accuracy (epoch 8) | 0.7074 | — | — |
+| Training time | ~6.3 min | ~6.3 min | — |
+
+## Analysis
+
+### Learning rate reduction had negligible effect
+- Dropping LR from 0.001 to 3e-4 changed best validation accuracy by **only 0.05 percentage points** (0.7315 → 0.7310).
+- Best validation loss also showed minimal change (0.5464 → 0.5497).
+- This indicates that **learning rate magnitude is not the primary bottleneck** in the current setup.
+
+### Generalization gap persists
+- At LR = 0.001, training accuracy rose from 0.6840 (epoch 2) to 0.8429 (epoch 8), while validation accuracy at epoch 8 dropped to 0.7074.
+- The model continues to fit training data without corresponding improvement on validation — consistent with **overfitting / insufficient model regularization**, not a learning rate problem.
+- The fact that the best checkpoint is saved at epoch 2 (by validation loss) does **not** prove the learning rate is too large; it indicates the model begins overfitting early regardless of LR choice within this range.
+
+### Implication for optimization direction
+- Multiple optimization strategies (warmup, cosine decay, label smoothing, LR reduction) have each produced **< 1 percentage point** change in best validation metrics.
+- This pattern suggests the limitation is **architectural or data-level**, not an optimization hyperparameter issue.
+
+## Next Steps (Proposed)
+
+| Priority | Action | Rationale |
+|----------|--------|-----------|
+| 1 | **Visual inspection of processed slices and error cases** | Confirm cropping does not discard critical brain regions; verify train/val preprocessing is consistent. Zero compute cost. |
+| 2 | **Increase weight decay** (0.0001 → 0.01), LR = 0.001, 8 epochs | ConvNeXt's original ImageNet config used strong weight decay (0.05–0.1). Even 0.01 is a reasonable test on MRI data. Targets overfitting directly. |
+| 3 | **Multi-slice input** (adjacent slices as 3 channels) | More informative than duplicating grayscale; adds anatomical context. Larger data-processing change, deferred until after steps 1–2. |
+
+## Reportable Conclusions
+
+- Reducing learning rate from 0.001 to 3e-4 **did not meaningfully change** best validation loss or accuracy.
+- The persistent generalization gap across all LR variants (fixed, warmup+cosine, reduced) indicates **overfitting is the dominant issue**, not step-size selection.
+- Further hyperparameter tuning of learning rate alone is unlikely to reach the 0.80 target; **regularization (weight decay) and data representation** are more promising directions.
+- All results remain at the **image-level validation** stage; no claim about test-set or patient-level performance can be made until the best checkpoint is formally evaluated.
