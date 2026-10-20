@@ -228,3 +228,37 @@ In an exploratory validation threshold analysis, setting the 2.5D patient level 
 - At default threshold (0.5), overall validation accuracy improved across all levels, but AD recall dropped substantially.
 - Threshold tuning on validation data can recover AD recall at the cost of more false positives; such tuning must not be applied to the test set.
 - Code changes are concentrated in `dataset.py` (data loading logic); `train.py` and `predict.py` received minor updates for compatibility and logging; `modules.py` is unchanged.
+
+- ## 3. Brightness and Contrast Augmentation Experiment
+
+### 中文版
+
+在 2.5D 输入实验的基础上，我们仅在训练阶段加入小幅随机亮度和对比度变化（各为 ±10%）。相邻切片输入、患者级数据划分、ConvNeXt-Tiny 模型、学习率 0.001、权重衰减 0.0001 和 8 轮训练均保持不变。最低验证损失出现在第 4 轮，为 0.5517；未加入该增强的 2.5D 实验在第 3 轮达到 0.5513。因此，增强后的最佳验证损失没有改善。
+
+在默认阈值 0.5 下，增强后的图像、扫描和患者级验证准确率分别为 **75.74%、78.70% 和 81.37%**，相比未增强的 2.5D 模型的 74.19%、78.24% 和 79.41% 均有所提高。图像级 AD recall 从 62.62% 提升至 64.80%，患者级 AUROC 从 0.8612 提升至 0.8757。然而，患者级 AD recall 仍为 **57.58%（19/33）**，没有改善。这些结果支持保留该增强作为候选方案，但单次实验不足以证明提升一定由增强造成。
+
+### English Version
+
+Building on the 2.5D input experiment, we added mild random brightness and contrast variation (±10% each) during training only. The adjacent-slice input, patient-level split, ConvNeXt-Tiny architecture, learning rate (0.001), weight decay (0.0001), and eight-epoch schedule were unchanged. The lowest validation loss occurred at epoch 4 (0.5517), compared with 0.5513 at epoch 3 without this augmentation. Thus, the best validation loss did not improve.
+
+At the default threshold of 0.5, image-, scan-, and patient-level validation accuracies were **75.74%, 78.70%, and 81.37%**, respectively, compared with 74.19%, 78.24%, and 79.41% for the unaugmented 2.5D model. Image-level AD recall increased from 62.62% to 64.80%, and patient-level AUROC increased from 0.8612 to 0.8757. However, patient-level AD recall remained **57.58% (19/33)**. These results support retaining the augmentation as a candidate setting, although a single run does not establish that the improvement was caused by augmentation.
+
+---
+
+## 4. Patient-Level Threshold Selection and Held-Out Test Results
+
+### 中文版
+
+针对加入增强后的模型，我们使用**验证集患者级预测概率**选择 AD 分类阈值。将患者级阈值从默认的 0.5 降至 0.38 后，验证集患者准确率为 **83.33%（85/102）**，AD recall 为 **78.79%（26/33）**；AD 漏判从 14 人减少至 7 人，而 NC 误报从 5 人增加至 10 人。图像级和扫描级阈值仍保持 0.5。阈值 0.38 随后被冻结，并用于测试集评估。
+
+在测试集上，图像、扫描和患者级准确率分别为 **72.91%、76.44% 和 81.37%**，AUROC 分别为 **0.8135、0.8583 和 0.8555**。患者级混淆矩阵显示，69 名 NC 患者中有 60 名被正确识别，33 名 AD 患者中有 23 名被正确识别；患者级 AD recall 为 **69.70%（23/33）**，仍有 10 名 AD 患者被漏判。
+
+因此，该模型在测试集上达到了预先设定的**患者级准确率和 AUROC 均不低于 0.80** 的目标，但图像级准确率未达到 0.80，AD 漏判也仍是重要限制。阈值是在验证集上选定的；测试集结果仅用于最终评估，不用于再次调整模型或阈值。
+
+### English Version
+
+For the augmented model, we selected the AD decision threshold using **patient-level probabilities from the validation set**. Lowering the patient-level threshold from 0.5 to 0.38 produced **83.33% validation accuracy (85/102)** and **78.79% AD recall (26/33)**. AD false negatives decreased from 14 to 7, while NC false positives increased from 5 to 10. Image- and scan-level thresholds remained at 0.5. The patient-level threshold was then fixed at 0.38 for test evaluation.
+
+On the held-out test set, image-, scan-, and patient-level accuracies were **72.91%, 76.44%, and 81.37%**, with AUROC values of **0.8135, 0.8583, and 0.8555**, respectively. At the patient level, 60 of 69 NC patients and 23 of 33 AD patients were correctly classified. Patient-level AD recall was **69.70% (23/33)**, leaving 10 AD patients incorrectly classified as NC.
+
+The model therefore met the predefined **patient-level accuracy and AUROC targets of at least 0.80** on the test set. Image-level accuracy remained below 0.80, and missed AD patients remain an important limitation. The threshold was selected using validation data; test results were used for final evaluation, not for further model or threshold selection.
