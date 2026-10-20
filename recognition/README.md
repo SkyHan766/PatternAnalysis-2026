@@ -262,3 +262,37 @@ For the augmented model, we selected the AD decision threshold using **patient-l
 On the held-out test set, image-, scan-, and patient-level accuracies were **72.91%, 76.44%, and 81.37%**, with AUROC values of **0.8135, 0.8583, and 0.8555**, respectively. At the patient level, 60 of 69 NC patients and 23 of 33 AD patients were correctly classified. Patient-level AD recall was **69.70% (23/33)**, leaving 10 AD patients incorrectly classified as NC.
 
 The model therefore met the predefined **patient-level accuracy and AUROC targets of at least 0.80** on the test set. Image-level accuracy remained below 0.80, and missed AD patients remain an important limitation. The threshold was selected using validation data; test results were used for final evaluation, not for further model or threshold selection.
+
+## 5. Dropout Regularisation Experiment
+
+### 中文版
+
+为检验分类头正则化能否缓解后期验证损失上升的问题，我们在 ConvNeXt-Tiny 分类头的最终线性层之前加入 `Dropout(p=0.2)`。模型仍从零训练，可训练参数保持为 27,821,666；2.5D 输入、训练阶段的亮度与对比度增强、数据划分、学习率 0.001、权重衰减 0.0001 和 8 轮训练均未改变。因此，本次实验主要比较加入分类头 dropout 前后的结果。
+
+加入 dropout 后，最低验证损失出现在第 2 轮，为 **0.5669**；未加入 dropout 的模型在第 4 轮达到 **0.5517**。按最低验证损失保存的 dropout 模型，图像级验证准确率为 **73.66%**、AUROC 为 **0.8135**，低于未加入 dropout 时的 **75.74%** 和 **0.8257**。扫描级准确率也从 78.70% 降至 75.93%。
+
+在相同的患者级 AD 阈值 **0.38** 下，dropout 模型的患者准确率为 **74.51%**、AUROC 为 **0.8586**，低于未加入 dropout 模型的 **83.33%** 和 **0.8757**。两个模型均正确识别了 33 名 AD 患者中的 26 名，但 NC 误报从 **10/69** 增至 **19/69**。这说明本次患者级准确率下降主要与更多 NC 患者被判为 AD 有关。
+
+Dropout 模型第 2 轮之后的训练准确率继续上升，至第 8 轮达到 85.59%；同期验证损失升至 0.7236。本次设置未能阻止后期验证表现恶化。由于结果只来自一次训练，不能据此断言分类头 dropout 一般无效；但在本项目当前配置下，**没有证据支持保留 `p=0.2` 的 dropout**。因此，后续以未加入 dropout 的 2.5D＋亮度对比度增强模型作为当前候选模型，本次 dropout 模型不进入测试集评估。
+
+### English Version
+
+To examine whether classifier-head regularisation could reduce the later rise in validation loss, we inserted `Dropout(p=0.2)` immediately before the final linear layer of ConvNeXt-Tiny. The model remained randomly initialised with 27,821,666 trainable parameters. The 2.5D input, training-time brightness and contrast augmentation, data split, learning rate (0.001), weight decay (0.0001), and eight-epoch schedule were unchanged. This experiment therefore focused on the effect of adding classifier-head dropout.
+
+With dropout, the lowest validation loss occurred at epoch 2 (**0.5669**), compared with **0.5517** at epoch 4 without dropout. The selected dropout checkpoint achieved **73.66% image-level validation accuracy** and **0.8135 AUROC**, below the corresponding results without dropout (**75.74%** and **0.8257**). Scan-level accuracy also decreased from 78.70% to 75.93%.
+
+Using the same patient-level AD threshold of **0.38**, the dropout model achieved **74.51% patient-level accuracy** and **0.8586 AUROC**, compared with **83.33%** and **0.8757** without dropout. Both models correctly identified 26 of 33 AD patients, but NC false positives increased from **10 of 69** to **19 of 69**. The lower patient-level accuracy was therefore associated mainly with more NC patients being classified as AD.
+
+After epoch 2, training accuracy continued to increase, reaching 85.59% at epoch 8, while validation loss rose to 0.7236. This dropout setting did not prevent later deterioration in validation performance. A single run cannot establish that classifier-head dropout is ineffective in general. However, these results **do not support retaining `p=0.2` dropout in the current configuration**. We retained the 2.5D model with brightness and contrast augmentation but without dropout as the current candidate, and did not evaluate the dropout model on the test set.
+
+---
+
+## 6. Data-Split Clarification
+
+### 中文版
+
+所有上述对比均使用相同的自建患者级划分。当前数据处理代码汇总课程数据原有的训练和测试文件夹后，按患者及类别分层，重新划分为 **70% 训练、15% 验证、15% 测试**，分别包含 **476、102 和 102 名患者**。不同新划分之间没有患者重叠，但这里的"测试集"**不是课程数据原有的测试文件夹**。因此，报告中的测试结果应准确称为"重新划分后保留的测试集结果"；是否还需保持原始测试集独立，应依据作业要求确认。
+
+### English Version
+
+All comparisons above used the same custom patient-level split. The current data preparation code pooled the course dataset's original training and test folders, then created a new stratified **70% training, 15% validation, and 15% test** split by patient, containing **476, 102, and 102 patients**, respectively. Patients do not overlap across the new splits. However, the reported "test set" is **not the course dataset's original test folder**. Test results should therefore be described as results on the newly held-out test split; whether the original test folder must remain independent should be checked against the assignment requirements.
