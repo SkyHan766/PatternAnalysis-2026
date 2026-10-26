@@ -1,381 +1,251 @@
+"""
+train.py — 训练 Narrow ConvNeXt 进行 AD vs NC 分类
 
-import argparse
+用法示例：
+  python train.py --data_root /content/comp3710_adni/ADNI \
+      --out_dir checkpoints --epochs 30 --batch_size 64 --lr 1e-3
+
+若已有 manifest.csv（dataset.py 生成或提供）：
+  python train.py --manifest manifest.csv --out_dir checkpoints
+
+训练日志（loss、各 split 统计、患者重叠检查）写入 out_dir/train_log.txt，
+最佳模型按 val balanced accuracy 保存为 best_model.pth。
+"""
+import os
 import time
-from pathlib import Path
+import argparse
+from copy import deepcopy
+import numpy as np
 
-import pandas as pd
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
+from torch.utils.data import DataLoader
 
+from modules import ConvNeXtNarrow, build_model
 from dataset import (
-    DEFAULT_MANIFEST_PATH,
-    DEFAULT_OUTPUT_DIR,
-    DEFAULT_WORK_DIR,
-    DEFAULT_ZIP_PATH,
-    create_dataloaders,
-    prepare_data,
-    save_batch_preview,
-)
-from modules import (
-    CLASS_TO_INDEX,
-    build_model,
-    check_model_output,
-    count_parameters,
-    get_device,
-    set_seed,
+    build_manifest, load_manifest, ADNISliceDataset, split_dataframe,
+    ensure_data_root, DEFAULT_DATA_ROOT, DEFAULT_ZIP_PATH, DEFAULT_OUTPUT_DIR,
 )
 
 
-def run_one_epoch(
-    model,
-    loader,
-    device,
-    criterion,
-    optimizer=None,
-):
-    """Run one complete training epoch or validation pass."""
-    is_training = optimizer is not None
-    model.train(is_training)
-    description = "Train" if is_training else "Validation"
-
-    total_loss = 0.0
-    total_correct = 0
-    total_images = 0
-
-    progress = tqdm(loader, desc=description, leave=False)
-
-    for images, labels, _subject_ids in progress:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        if is_training:
-            optimizer.zero_grad(set_to_none=True)
-
-        with torch.set_grad_enabled(is_training):
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=(device.type == "cuda"),
-            ):
-                logits = model(images)
-                loss = criterion(logits, labels)
-
-            if is_training:
-                loss.backward()
-                optimizer.step()
-
-        batch_size = labels.size(0)
-        total_images += batch_size
-        total_loss += loss.item() * batch_size
-        total_correct += (
-            (logits.argmax(dim=1) == labels).sum().item()
-        )
-
-    if total_images == 0:
-        raise ValueError("DataLoader returned no images.")
-
-    return {
-        "loss": total_loss / total_images,
-        "accuracy": total_correct / total_images,
-    }
+def set_seed(seed=42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def train_model(
-    model_name,
-    model,
-    train_loader,
-    validation_loader,
-    device,
-    output_dir,
-    epochs,
-    learning_rate,
-    weight_decay,
-    warmup_epochs,
-    min_learning_rate,
-    label_smoothing,
-):
-    """Train all model parameters from scratch and save best validation loss."""
-    if not 0 <= warmup_epochs < epochs:
-        raise ValueError(
-            "warmup_epochs must be at least 0 and smaller than epochs."
-        )
-    if not 0.0 <= label_smoothing < 1.0:
-        raise ValueError("label_smoothing must be in the range [0, 1).")
+def log_msg(log_file, msg):
+    print(msg)
+    with open(log_file, "a") as f:
+        f.write(msg + "\n")
 
-    # Label smoothing is a training regularizer. Keep validation loss as
-    # standard cross-entropy so it remains comparable with earlier runs.
-    train_criterion = nn.CrossEntropyLoss(
-        label_smoothing=label_smoothing,
-    )
-    validation_criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
 
-    cosine_epochs = epochs - warmup_epochs
-    if warmup_epochs > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=warmup_epochs,
-        )
-        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=cosine_epochs,
-            eta_min=min_learning_rate,
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs],
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=epochs,
-            eta_min=min_learning_rate,
-        )
+class ModelEMA:
+    """Maintain an exponential moving average of model parameters."""
 
-    checkpoint_path = output_dir / "best_model.pt"
-    history_path = output_dir / "training_history.csv"
-    history = []
-    best_validation_loss = float("inf")
+    def __init__(self, model, decay=0.999):
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("ema_decay must satisfy 0 <= ema_decay < 1")
+        self.decay = float(decay)
+        self.module = deepcopy(model).eval()
+        self.module.requires_grad_(False)
 
-    for epoch in range(1, epochs + 1):
-        epoch_learning_rate = optimizer.param_groups[0]["lr"]
-        train_metrics = run_one_epoch(
-            model=model,
-            loader=train_loader,
-            device=device,
-            criterion=train_criterion,
-            optimizer=optimizer,
-        )
-        validation_metrics = run_one_epoch(
-            model=model,
-            loader=validation_loader,
-            device=device,
-            criterion=validation_criterion,
-            optimizer=None,
-        )
-
-        history.append({
-            "model": model_name,
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_accuracy": train_metrics["accuracy"],
-            "validation_loss": validation_metrics["loss"],
-            "validation_accuracy": validation_metrics["accuracy"],
-            "learning_rate": epoch_learning_rate,
-        })
-        pd.DataFrame(history).to_csv(history_path, index=False)
-
-        improved = validation_metrics["loss"] < best_validation_loss
-        if improved:
-            best_validation_loss = validation_metrics["loss"]
-            torch.save(
-                {
-                    "model_name": model_name,
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "validation_loss": validation_metrics["loss"],
-                    "validation_accuracy": validation_metrics["accuracy"],
-                    "class_to_index": CLASS_TO_INDEX,
-                    "pretrained": False,
-                    "parameter_count": count_parameters(model),
-                    "learning_rate": learning_rate,
-                    "weight_decay": weight_decay,
-                    "warmup_epochs": warmup_epochs,
-                    "min_learning_rate": min_learning_rate,
-                    "label_smoothing": label_smoothing,
-                    "scheduler": "linear_warmup_then_cosine_decay",
-                },
-                checkpoint_path,
+    @torch.no_grad()
+    def update(self, model):
+        model_parameters = dict(model.named_parameters())
+        for name, ema_parameter in self.module.named_parameters():
+            model_parameter = model_parameters[name].detach()
+            ema_parameter.mul_(self.decay).add_(
+                model_parameter,
+                alpha=1.0 - self.decay,
             )
 
-        saved_text = " | saved best" if improved else ""
-        print(
-            f"{model_name} | epoch {epoch}/{epochs} | "
-            f"lr {epoch_learning_rate:.7f} | "
-            f"train loss {train_metrics['loss']:.4f}, "
-            f"acc {train_metrics['accuracy']:.4f} | "
-            f"val loss {validation_metrics['loss']:.4f}, "
-            f"acc {validation_metrics['accuracy']:.4f}"
-            f"{saved_text}"
-        )
-        scheduler.step()
-
-    return checkpoint_path, history_path
+        # Keep non-trainable state synchronized. ConvNeXt currently has no
+        # running-stat buffers, but copying them makes EMA safe for extensions.
+        model_buffers = dict(model.named_buffers())
+        for name, ema_buffer in self.module.named_buffers():
+            ema_buffer.copy_(model_buffers[name].detach())
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train a from-scratch ConvNeXt-Tiny or parameter-matched "
-            "plain CNN on ADNI AD/NC images."
-        )
-    )
-    parser.add_argument(
-        "--model",
-        choices=["convnext", "baseline"],
-        default="convnext",
-        help="Architecture to train.",
-    )
-    parser.add_argument("--zip_path", type=Path, default=DEFAULT_ZIP_PATH)
-    parser.add_argument("--work_dir", type=Path, default=DEFAULT_WORK_DIR)
-    parser.add_argument(
-        "--manifest_path",
-        type=Path,
-        default=DEFAULT_MANIFEST_PATH,
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-    )
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument(
-        "--warmup_epochs",
-        type=int,
-        default=2,
-        help="Number of initial epochs used for linear learning-rate warm-up.",
-    )
-    parser.add_argument(
-        "--min_learning_rate",
-        type=float,
-        default=1e-6,
-        help="Minimum learning rate reached by cosine decay.",
-    )
-    parser.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.1,
-        help="Label smoothing used for training loss only.",
-    )
-    parser.add_argument(
-        "--expected_rows",
-        type=int,
-        default=30520,
-        help="Set to -1 to disable the manifest row-count check.",
-    )
-    parser.add_argument(
-        "--rebuild_manifest",
-        action="store_true",
-        help="Recreate the patient-level manifest and split.",
-    )
-    return parser.parse_args()
+# --------------------------------------------------------------------------- #
+# 训练 / 验证循环
+# --------------------------------------------------------------------------- #
+def run_epoch(model, loader, criterion, optimizer, device, scaler=None, ema=None):
+    model.train()
+    total_loss, total_correct, total_n = 0.0, 0, 0
+    for x, y, _ in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:  # AMP 混合精度
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(x)
+                loss = criterion(logits, y)
+            scaler.scale(loss).backward()
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            # GradScaler skips optimizer.step() when gradients overflow.
+            if ema is not None and scaler.get_scale() >= previous_scale:
+                ema.update(model)
+        else:
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            if ema is not None:
+                ema.update(model)
+        total_loss += loss.item() * x.size(0)
+        total_correct += (logits.argmax(1) == y).sum().item()
+        total_n += x.size(0)
+    return total_loss / total_n, total_correct / total_n
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    """返回 (balanced_acc, acc)；用 NC/AD 两类召回率的平均值作为选模型指标。"""
+    model.eval()
+    correct, total_n = 0, 0
+    tp_ad = fp_ad = fn_ad = 0
+    tp_nc = fp_nc = fn_nc = 0
+    for x, y, _ in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item()
+        total_n += x.size(0)
+        for p, t in zip(pred.tolist(), y.tolist()):
+            if t == 1:  # AD
+                if p == 1:
+                    tp_ad += 1
+                else:
+                    fn_ad += 1
+            else:       # NC
+                if p == 0:
+                    tp_nc += 1
+                else:
+                    fp_nc += 1
+    fp_ad = fp_nc  # 预测为AD但实际NC
+    fn_nc = fp_nc  # 实际为NC，但预测为AD
+    rec_ad = tp_ad / (tp_ad + fn_ad) if (tp_ad + fn_ad) else 0.0
+    rec_nc = tp_nc / (tp_nc + fn_nc) if (tp_nc + fn_nc) else 0.0
+    balanced_acc = (rec_ad + rec_nc) / 2
+    return balanced_acc, correct / max(total_n, 1)
 
 
 def main():
-    args = parse_args()
-    expected_rows = None if args.expected_rows < 0 else args.expected_rows
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
+    ap.add_argument("--zip_path", default=DEFAULT_ZIP_PATH)
+    ap.add_argument("--manifest", default=None,
+                    help="已有 manifest csv 路径；不提供则现场扫描生成")
+    ap.add_argument("--out_dir", "--output_dir", dest="out_dir", default=DEFAULT_OUTPUT_DIR)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_decay", type=float, default=5e-2)
+    ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--amp", action="store_true", help="启用混合精度训练")
+    ap.add_argument("--base_channels", type=int, default=32)
+    ap.add_argument("--drop_path_rate", type=float, default=0.2)
+    ap.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.999,
+        help="EMA decay applied after each successful optimizer update.",
+    )
+    args = ap.parse_args()
 
     set_seed(args.seed)
-    device = get_device(require_cuda=True)
+    os.makedirs(args.out_dir, exist_ok=True)
+    log_file = os.path.join(args.out_dir, "train_log.txt")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Separate folders prevent one model's files from overwriting the other.
-    model_output_dir = args.output_dir / args.model
-    model_output_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = prepare_data(
-        zip_path=args.zip_path,
-        work_dir=args.work_dir,
-        manifest_path=args.manifest_path,
-        rebuild_manifest=args.rebuild_manifest,
-        expected_rows=expected_rows,
-        seed=args.seed,
-    )
-
-    train_loader, validation_loader, _test_loader = create_dataloaders(
-        manifest=manifest,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        seed=args.seed,
-    )
-
-    save_batch_preview(
-        train_loader,
-        model_output_dir / "sample_batch.png",
-    )
-
-    # Both architectures are initialized randomly and fully trained from epoch 1.
-    model = build_model(model_name=args.model, num_classes=2).to(device)
-    model_parameters = count_parameters(model)
-    other_model_name = "baseline" if args.model == "convnext" else "convnext"
-    # Count the comparison model without changing the RNG state used for training.
-    with torch.random.fork_rng(devices=[]):
-        reference_model = build_model(model_name=other_model_name, num_classes=2)
-        reference_parameters = count_parameters(reference_model)
-        del reference_model
-    parameter_gap_percent = (
-        abs(model_parameters - reference_parameters)
-        / max(model_parameters, reference_parameters)
-        * 100.0
-    )
-    print(f"Model: {args.model}")
-    print(f"Trainable parameters: {model_parameters:,}")
-    print(
-        f"{other_model_name} comparison parameters: "
-        f"{reference_parameters:,} ({parameter_gap_percent:.3f}% gap)"
-    )
-    if parameter_gap_percent > 1.0:
-        raise RuntimeError(
-            "The two model parameter counts differ by more than 1%; "
-            "review the baseline architecture before benchmarking."
+    # ---------------- 数据 ----------------
+    args.data_root = ensure_data_root(args.data_root, args.zip_path)
+    if args.manifest:
+        if not os.path.isfile(args.manifest):
+            raise FileNotFoundError(f"manifest 不存在：{args.manifest}")
+        df = load_manifest(args.manifest, data_root=args.data_root)
+        df.to_csv(os.path.join(args.out_dir, "manifest.csv"), index=False)
+        log_msg(log_file, f"加载已有 manifest: {args.manifest}")
+    else:
+        df = build_manifest(
+            args.data_root,
+            out_csv=os.path.join(args.out_dir, "manifest.csv"),
+            seed=args.seed,
         )
-    print(
-        f"Optimizer: AdamW | base learning rate: {args.learning_rate} | "
-        f"weight decay: {args.weight_decay}"
+    subsets = split_dataframe(df)
+
+    train_ds = ADNISliceDataset(subsets["train"], args.img_size, train=True)
+    val_ds = ADNISliceDataset(subsets["val"], args.img_size, train=False)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True,
+                              drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
+
+    # ---------------- 模型 / 优化器 ----------------
+    model = ConvNeXtNarrow(
+        in_channels=1, num_classes=2,
+        base_channels=args.base_channels,
+        depths=(3, 3, 9, 3),
+        drop_path_rate=args.drop_path_rate,
+    ).to(device)
+    ema = ModelEMA(model, decay=args.ema_decay)
+    log_msg(log_file, f"参数量: {model.num_parameters():,}")
+    log_msg(log_file, f"device: {device}")
+    log_msg(log_file, f"EMA decay: {args.ema_decay}")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    print(
-        f"Scheduler: linear warm-up for {args.warmup_epochs} epochs, "
-        f"then cosine decay to {args.min_learning_rate}"
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs
     )
-    print(f"Training label smoothing: {args.label_smoothing}")
-    print(f"Epochs: {args.epochs} | pretrained weights: none")
+    scaler = torch.cuda.amp.GradScaler() if (args.amp and device == "cuda") else None
 
-    check_model_output(model, device, input_size=224)
+    # ---------------- 训练循环 ----------------
+    best_bal_acc = 0.0
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = run_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, ema
+        )
+        # Model selection and reported validation metrics use EMA weights.
+        val_bal_acc, val_acc = evaluate(ema.module, val_loader, device)
+        scheduler.step()
 
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.synchronize(device)
+        msg = (f"epoch {epoch:3d}/{args.epochs} | "
+               f"loss {train_loss:.4f} | "
+               f"train_acc {train_acc:.4f} | "
+               f"val_acc {val_acc:.4f} | "
+               f"val_bal_acc {val_bal_acc:.4f} | "
+               f"lr {scheduler.get_last_lr()[0]:.2e} | "
+               f"{time.time() - t0:.1f}s")
+        log_msg(log_file, msg)
 
-    start_time = time.perf_counter()
-    checkpoint_path, history_path = train_model(
-        model_name=args.model,
-        model=model,
-        train_loader=train_loader,
-        validation_loader=validation_loader,
-        device=device,
-        output_dir=model_output_dir,
-        epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_epochs=args.warmup_epochs,
-        min_learning_rate=args.min_learning_rate,
-        label_smoothing=args.label_smoothing,
-    )
+        if val_bal_acc >= best_bal_acc:
+            best_bal_acc = val_bal_acc
+            torch.save({
+                "epoch": epoch,
+                # Keep state_dict as EMA for backward compatibility with the
+                # existing predict.py checkpoint interface.
+                "state_dict": ema.module.state_dict(),
+                "ema_state_dict": ema.module.state_dict(),
+                "model_state_dict": model.state_dict(),
+                "weight_source": "ema",
+                "ema_decay": args.ema_decay,
+                "val_bal_acc": val_bal_acc,
+                "args": vars(args),
+            }, os.path.join(args.out_dir, "best_model.pth"))
+            log_msg(log_file, f"  -> 保存最佳模型 (val_bal_acc={val_bal_acc:.4f})")
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elapsed_seconds = time.perf_counter() - start_time
-
-    print("\nTraining completed.")
-    print(f"Training time: {elapsed_seconds / 60:.2f} minutes")
-    if device.type == "cuda":
-        peak_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        print(f"Peak allocated GPU memory: {peak_memory_gb:.2f} GB")
-
-    print("Training history:", history_path)
-    print("Best checkpoint:", checkpoint_path)
+    log_msg(log_file, f"训练完成，最佳 val_bal_acc = {best_bal_acc:.4f}")
 
 
 if __name__ == "__main__":

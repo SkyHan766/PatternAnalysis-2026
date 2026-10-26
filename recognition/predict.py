@@ -1,543 +1,253 @@
+"""
+predict.py — 在 test 集上评估训练好的 Narrow ConvNeXt
 
-import argparse
+输出（控制台 + out_dir/eval_report.json + eval_report.txt）：
+1) 三个层级的 9 项性能指标，各配混淆矩阵与样本数：
+   - Image  级：每张切片单独预测
+   - Scan   级：同一扫描的切片 AD 概率取平均
+   - Patient级：同一患者的扫描 AD 概率再取平均
+   指标：Accuracy, Balanced accuracy, NC precision, NC recall,
+        AD precision, AD recall, Macro-F1, AD F1, ROC-AUC
+2) 资源统计：参数量、推理耗时（每张切片）、峰值 GPU 显存。
+
+用法：
+  python predict.py --checkpoint checkpoints/best_model.pth \
+      --manifest checkpoints/manifest.csv --split test
+"""
+import os
+import json
 import time
-from pathlib import Path
+import argparse
 
-import matplotlib.pyplot as plt
-import pandas as pd
+import numpy as np
 import torch
+from torch.utils.data import DataLoader
+
+from modules import ConvNeXtNarrow
+from dataset import (load_manifest, ADNISliceDataset, ensure_data_root,
+                     DEFAULT_DATA_ROOT, DEFAULT_ZIP_PATH)
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
-    accuracy_score,
-    balanced_accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_recall_fscore_support,
-    recall_score,
-    roc_auc_score,
+    accuracy_score, balanced_accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix,
 )
-from torch.utils.data import SequentialSampler
-
-from dataset import (
-    DEFAULT_MANIFEST_PATH,
-    DEFAULT_OUTPUT_DIR,
-    DEFAULT_WORK_DIR,
-    DEFAULT_ZIP_PATH,
-    create_dataloaders,
-    prepare_data,
-)
-from modules import build_model, count_parameters, get_device
 
 
-def select_best_checkpoint(
-    model,
-    device,
-    model_name: str,
-    output_dir: Path,
-) -> tuple[Path, dict]:
-    """Load the selected validation-loss checkpoint for one architecture."""
-    checkpoint_path = output_dir / "best_model.pt"
+# --------------------------------------------------------------------------- #
+# 指标计算：9 项
+# --------------------------------------------------------------------------- #
+def compute_metrics(y_true, y_prob_ad):
+    """y_prob_ad: 预测为 AD 的概率 (n,)。"""
+    y_pred = (y_prob_ad >= 0.5).astype(int)
+    y_true = np.asarray(y_true).astype(int)
 
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}. "
-            f"Run train.py --model {model_name} first."
-        )
+    acc = accuracy_score(y_true, y_pred)
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    nc_prec = precision_score(y_true, y_pred, pos_label=0, zero_division=0)
+    nc_rec = recall_score(y_true, y_pred, pos_label=0, zero_division=0)
+    ad_prec = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+    ad_rec = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+    macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    ad_f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+    try:
+        auc = roc_auc_score(y_true, y_prob_ad)
+    except ValueError:  # 单类别等退化情形
+        auc = float("nan")
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-    )
-
-    if checkpoint.get("model_name") != model_name:
-        raise ValueError(
-            f"Checkpoint architecture is {checkpoint.get('model_name')!r}, "
-            f"but requested {model_name!r}."
-        )
-
-    if checkpoint.get("pretrained") is not False:
-        raise ValueError(
-            "This checkpoint is not marked as trained from scratch. "
-            "Use a checkpoint created by the updated train.py."
-        )
-
-    model.load_state_dict(checkpoint["model_state"])
-    model.to(device)
-    model.eval()
-
-    print("\nSelected:", checkpoint_path.name)
-    print("Model:", checkpoint["model_name"])
-    print("Epoch:", checkpoint["epoch"])
-    print("Validation loss:", checkpoint["validation_loss"])
-    print("Trainable parameters:", f"{count_parameters(model):,}")
-
-    return checkpoint_path, checkpoint
-
-def collect_predictions(
-    model,
-    loader,
-    device,
-) -> pd.DataFrame:
-    """对一个 split 的所有图像预测 AD 概率。"""
-    if not isinstance(loader.sampler, SequentialSampler):
-        raise AssertionError(
-            "评估 DataLoader 必须 shuffle=False，"
-            "以保证预测顺序和 manifest 一致。"
-        )
-
-    rows = loader.dataset.dataframe[
-        ["filepath", "label", "scan_id", "subject_id", "split"]
-    ].reset_index(drop=True).copy()
-
-    probabilities = []
-    observed_labels = []
-    observed_subjects = []
-
-    model.eval()
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-    inference_start = time.perf_counter()
-
-    with torch.inference_mode():
-        for images, labels, subject_ids in loader:
-            images = images.to(
-                device,
-                non_blocking=True,
-            )
-
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.bfloat16,
-                enabled=(device.type == "cuda"),
-            ):
-                logits = model(images)
-
-            prob_ad = torch.softmax(
-                logits.float(),
-                dim=1,
-            )[:, 1]
-
-            probabilities.extend(
-                prob_ad.cpu().tolist()
-            )
-            observed_labels.extend(
-                labels.tolist()
-            )
-            observed_subjects.extend(
-                list(subject_ids)
-            )
-
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    inference_seconds = time.perf_counter() - inference_start
-    if len(rows) > 0:
-        print(
-            f"Inference throughput: {inference_seconds / len(rows) * 1000:.3f} "
-            "ms/image (includes data loading)"
-        )
-    if device.type == "cuda":
-        peak_memory_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-        print(f"Peak allocated GPU memory during evaluation: {peak_memory_gb:.2f} GB")
-
-    if len(probabilities) != len(rows):
-        raise AssertionError(
-            "预测数量和 manifest 行数不一致。"
-        )
-
-    if observed_labels != rows["label"].astype(int).tolist():
-        raise AssertionError(
-            "DataLoader 标签顺序和 manifest 不一致。"
-        )
-
-    if observed_subjects != rows["subject_id"].astype(str).tolist():
-        raise AssertionError(
-            "DataLoader 患者顺序和 manifest 不一致。"
-        )
-
-    rows["prob_ad"] = probabilities
-    rows["pred_label"] = (
-        rows["prob_ad"] >= 0.5
-    ).astype(int)
-
-    return rows
-
-
-def aggregate_predictions(
-    image_rows: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    从切片级预测聚合到扫描级和患者级。
-
-    先平均同一扫描切片的 AD 概率，
-    再平均同一患者不同扫描的 AD 概率。
-    """
-    slices_per_scan = image_rows.groupby(
-        ["subject_id", "scan_id"]
-    )["label"].nunique()
-
-    if not (slices_per_scan == 1).all():
-        raise AssertionError(
-            "同一扫描中出现了不一致的标签。"
-        )
-
-    scan_rows = (
-        image_rows.groupby(
-            ["subject_id", "scan_id"],
-            as_index=False,
-        )
-        .agg(
-            label=("label", "first"),
-            prob_ad=("prob_ad", "mean"),
-        )
-    )
-
-    scans_per_subject = scan_rows.groupby(
-        "subject_id"
-    )["label"].nunique()
-
-    if not (scans_per_subject == 1).all():
-        raise AssertionError(
-            "同一患者的不同扫描出现了不一致的标签。"
-        )
-
-    patient_rows = (
-        scan_rows.groupby(
-            "subject_id",
-            as_index=False,
-        )
-        .agg(
-            label=("label", "first"),
-            prob_ad=("prob_ad", "mean"),
-        )
-    )
-
-    for table in (scan_rows, patient_rows):
-        table["pred_label"] = (
-            table["prob_ad"] >= 0.5
-        ).astype(int)
-
-    return scan_rows, patient_rows
-
-
-def calculate_metrics(
-    rows: pd.DataFrame,
-) -> tuple[dict, object]:
-    """计算准确率、平衡准确率、AD recall、AD F1 和 ROC-AUC。"""
-    truth = rows["label"].astype(int)
-    prediction = rows["pred_label"].astype(int)
-
-    class_precision, class_recall, class_f1, _ = (
-        precision_recall_fscore_support(
-            truth,
-            prediction,
-            labels=[0, 1],
-            zero_division=0,
-        )
-    )
-
-    metrics = {
-        "samples": len(rows),
-        "accuracy": accuracy_score(truth, prediction),
-        "balanced_accuracy": balanced_accuracy_score(truth, prediction),
-        "nc_precision": class_precision[0],
-        "nc_recall": class_recall[0],
-        "ad_precision": class_precision[1],
-        "ad_recall": class_recall[1],
-        "macro_f1": f1_score(
-            truth, prediction, average="macro", zero_division=0
-        ),
-        "ad_f1": class_f1[1],
-        "roc_auc": roc_auc_score(truth, rows["prob_ad"]),
+    return {
+        "accuracy": acc,
+        "balanced_accuracy": bal_acc,
+        "nc_precision": nc_prec,
+        "nc_recall": nc_rec,
+        "ad_precision": ad_prec,
+        "ad_recall": ad_rec,
+        "macro_f1": macro_f1,
+        "ad_f1": ad_f1,
+        "roc_auc": auc,
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
+        # 行=真实 [NC, AD]，列=预测 [NC, AD]
+        "n_samples": len(y_true),
     }
 
-    matrix = confusion_matrix(
-        truth,
-        prediction,
-        labels=[0, 1],
+
+def aggregate_level(df, prob_col, key):
+    """按 key (scan_id / patient_id) 聚合：组内 AD 概率取平均后阈值 0.5。"""
+    grp = df.groupby(key).agg(
+        y_true=("y_true", "first"),
+        prob=("prob_ad", "mean"),
     )
-
-    return metrics, matrix
-
-
-def evaluate_split(
-    model,
-    loader,
-    split_name: str,
-    device,
-    output_dir: Path,
-) -> pd.DataFrame:
-    """评估一个 split，并保存图片级、扫描级和患者级预测 CSV。"""
-    image_rows = collect_predictions(
-        model=model,
-        loader=loader,
-        device=device,
-    )
-
-    if set(image_rows["split"]) != {split_name}:
-        raise AssertionError(
-            f"DataLoader 中的数据并非全部属于 {split_name}。"
-        )
-
-    scan_rows, patient_rows = aggregate_predictions(
-        image_rows
-    )
-
-    result_rows = []
-
-    levels = [
-        ("image", image_rows),
-        ("scan", scan_rows),
-        ("patient", patient_rows),
-    ]
-
-    for level, rows in levels:
-        metrics, matrix = calculate_metrics(rows)
-
-        result_rows.append({
-            "split": split_name,
-            "level": level,
-            **metrics,
-        })
-
-        print(f"\n{split_name} — {level}")
-        print(
-            "Confusion matrix "
-            "(rows=actual, columns=predicted; NC, AD):"
-        )
-        print(matrix)
-
-        rows.to_csv(
-            output_dir / f"{split_name}_{level}_predictions.csv",
-            index=False,
-        )
-
-    summary = pd.DataFrame(result_rows)
-
-    print(f"\n{split_name} metrics:")
-    print(summary.round(4).to_string(index=False))
-
-    summary.to_csv(
-        output_dir / f"{split_name}_metrics.csv",
-        index=False,
-    )
-
-    return summary
+    return compute_metrics(grp["y_true"].values, grp["prob"].values)
 
 
-def save_result_figures(output_dir: Path) -> None:
-    """保存训练曲线和测试集图片级/患者级混淆矩阵。"""
-    history_path = output_dir / "training_history.csv"
-
-    if history_path.exists():
-        history_df = pd.read_csv(history_path)
-
-        epochs = range(1, len(history_df) + 1)
-        figure, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-        axes[0].plot(
-            epochs,
-            history_df["train_loss"],
-            marker="o",
-            label="Train",
-        )
-        axes[0].plot(
-            epochs,
-            history_df["validation_loss"],
-            marker="o",
-            label="Validation",
-        )
-        axes[0].set(
-            title="Loss by epoch",
-            xlabel="Epoch (from scratch)",
-            ylabel="Loss",
-        )
-        axes[0].legend()
-
-        axes[1].plot(
-            epochs,
-            history_df["train_accuracy"],
-            marker="o",
-            label="Train",
-        )
-        axes[1].plot(
-            epochs,
-            history_df["validation_accuracy"],
-            marker="o",
-            label="Validation",
-        )
-        axes[1].set(
-            title="Accuracy by epoch",
-            xlabel="Epoch (from scratch)",
-            ylabel="Accuracy",
-        )
-        axes[1].legend()
-
-        for axis in axes:
-            axis.grid(alpha=0.25)
-
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / "training_curves.png",
-            dpi=200,
-            bbox_inches="tight",
-        )
-        plt.close(figure)
-
-    # 测试集预测 CSV 存在时，生成图像级和患者级混淆矩阵。
-    image_csv = output_dir / "test_image_predictions.csv"
-    patient_csv = output_dir / "test_patient_predictions.csv"
-
-    if image_csv.exists() and patient_csv.exists():
-        figure, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-        for axis, level, csv_path in [
-            (axes[0], "image", image_csv),
-            (axes[1], "patient", patient_csv),
-        ]:
-            predictions = pd.read_csv(csv_path)
-
-            matrix = confusion_matrix(
-                predictions["label"],
-                predictions["pred_label"],
-                labels=[0, 1],
-            )
-
-            ConfusionMatrixDisplay(
-                confusion_matrix=matrix,
-                display_labels=["NC", "AD"],
-            ).plot(
-                ax=axis,
-                cmap="Blues",
-                colorbar=False,
-                values_format="d",
-            )
-
-            axis.set_title(f"Test: {level} level")
-
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / "test_confusion_matrices.png",
-            dpi=200,
-            bbox_inches="tight",
-        )
-        plt.close(figure)
-
-    print("Figures saved to:", output_dir)
+# --------------------------------------------------------------------------- #
+# 推理
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def infer(model, loader, device):
+    model.eval()
+    probs, labels, metas = [], [], []
+    n_imgs, total_time = 0, 0.0
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    for x, y, meta in loader:
+        x = x.to(device, non_blocking=True)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        logits = model(x)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        total_time += time.time() - t0
+        p = torch.softmax(logits, dim=1)[:, 1]  # AD 概率
+        probs.append(p.cpu().numpy())
+        labels.append(y.numpy())
+        n_imgs += x.size(0)
+    probs = np.concatenate(probs)
+    labels = np.concatenate(labels)
+    # 收集 meta（path/patient/scan）
+    for k in ("path", "patient_id", "scan_id"):
+        metas.append(meta_list(loader, k))
+    per_img_ms = total_time / max(n_imgs, 1) * 1000
+    peak_mem_mb = (torch.cuda.max_memory_allocated() / 1024 ** 2
+                   if device == "cuda" else 0.0)
+    return probs, labels, metas, per_img_ms, peak_mem_mb
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Evaluate a from-scratch ADNI classification model."
-    )
+def meta_list(loader, key):
+    """从 Dataset 中取出全部 meta（按顺序）。DataLoader 默认不返回 dict 列表的批量，故直接索引 dataset。"""
+    ds = loader.dataset
+    return [ds.df.iloc[i][key] for i in range(len(ds))]
 
-    parser.add_argument(
-        "--model",
-        choices=["convnext", "baseline"],
-        default="convnext",
-        help="Architecture checkpoint to evaluate.",
-    )
-    parser.add_argument(
-        "--zip_path",
-        type=Path,
-        default=DEFAULT_ZIP_PATH,
-    )
-    parser.add_argument(
-        "--work_dir",
-        type=Path,
-        default=DEFAULT_WORK_DIR,
-    )
-    parser.add_argument(
-        "--manifest_path",
-        type=Path,
-        default=DEFAULT_MANIFEST_PATH,
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=2,
-    )
-    parser.add_argument(
-        "--expected_rows",
-        type=int,
-        default=30520,
-        help="不检查行数时传入 -1。",
-    )
-    parser.add_argument(
-        "--split",
-        choices=["validation", "test", "both"],
-        default="both",
-        help="选择评估 validation、test 或两者。",
-    )
 
-    return parser.parse_args()
+# --------------------------------------------------------------------------- #
+# 报告打印
+# --------------------------------------------------------------------------- #
+METRIC_KEYS = [
+    ("accuracy", "Accuracy"),
+    ("balanced_accuracy", "Balanced accuracy"),
+    ("nc_precision", "NC precision"),
+    ("nc_recall", "NC recall"),
+    ("ad_precision", "AD precision"),
+    ("ad_recall", "AD recall"),
+    ("macro_f1", "Macro-F1"),
+    ("ad_f1", "AD F1"),
+    ("roc_auc", "ROC-AUC"),
+]
+
+
+def print_level(name, m, lines):
+    lines.append(f"\n===== {name} =====")
+    lines.append(f"样本数: {m['n_samples']}")
+    for k, label in METRIC_KEYS:
+        lines.append(f"  {label:18s}: {m[k]:.4f}")
+    cm = m["confusion_matrix"]
+    lines.append("  混淆矩阵 (行=真实 NC,AD; 列=预测 NC,AD):")
+    lines.append(f"    NC: {cm[0]}")
+    lines.append(f"    AD: {cm[1]}")
 
 
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--manifest", default=None, help="默认读取 checkpoint 同目录的 manifest.csv")
+    ap.add_argument("--data_root", default=None)
+    ap.add_argument("--zip_path", default=None)
+    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
+    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--out_dir", "--output_dir", dest="out_dir", default=None, help="报告输出目录，默认取 checkpoint 目录")
+    args = ap.parse_args()
 
-    expected_rows = (
-        None
-        if args.expected_rows < 0
-        else args.expected_rows
+    out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.checkpoint))
+    os.makedirs(out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ---------------- 模型 ----------------
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt_args = ckpt.get("args", {})
+    model = ConvNeXtNarrow(
+        in_channels=1, num_classes=2,
+        base_channels=ckpt_args.get("base_channels", 32),
+        depths=(3, 3, 9, 3),
+        drop_path_rate=ckpt_args.get("drop_path_rate", 0.2),
+    ).to(device)
+    if "ema_state_dict" in ckpt:
+        inference_state_dict = ckpt["ema_state_dict"]
+        weight_source = "ema"
+    else:
+        inference_state_dict = ckpt["state_dict"]
+        weight_source = ckpt.get("weight_source", "model")
+    model.load_state_dict(inference_state_dict)
+    n_params = model.num_parameters()
+
+    # ---------------- 数据 ----------------
+    data_root = ensure_data_root(
+        args.data_root or ckpt_args.get("data_root", DEFAULT_DATA_ROOT),
+        args.zip_path or ckpt_args.get("zip_path", DEFAULT_ZIP_PATH),
+    )
+    if args.manifest is None:
+        args.manifest = os.path.join(os.path.dirname(os.path.abspath(args.checkpoint)), "manifest.csv")
+    df = load_manifest(args.manifest, data_root=data_root)
+    df = df[df["split"] == args.split].reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError(f"manifest 中没有 split={args.split} 的样本")
+    ds = ADNISliceDataset(df, img_size=ckpt_args.get("img_size", 224), train=False)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers, pin_memory=True)
+
+    # ---------------- 推理 ----------------
+    probs, labels, (paths, pids, sids), per_img_ms, peak_mem = infer(
+        model, loader, device
     )
 
-    device = get_device(require_cuda=True)
-    model_output_dir = args.output_dir / args.model
-    model_output_dir.mkdir(parents=True, exist_ok=True)
+    import pandas as pd
+    rec = pd.DataFrame({
+        "path": paths, "patient_id": pids, "scan_id": sids,
+        "y_true": labels, "prob_ad": probs,
+    })
 
-    manifest = prepare_data(
-        zip_path=args.zip_path,
-        work_dir=args.work_dir,
-        manifest_path=args.manifest_path,
-        rebuild_manifest=False,
-        expected_rows=expected_rows,
-    )
+    # ---------------- 三个层级指标 ----------------
+    img_m = compute_metrics(rec["y_true"].values, rec["prob_ad"].values)
+    scan_m = aggregate_level(rec, "prob_ad", "scan_id")
+    pat_m = aggregate_level(rec, "prob_ad", "patient_id")
 
-    _train_loader, validation_loader, test_loader = create_dataloaders(
-        manifest=manifest,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+    lines = []
+    lines.append(f"checkpoint: {args.checkpoint}")
+    lines.append(f"weight source: {weight_source}")
+    if weight_source == "ema":
+        lines.append(f"EMA decay: {ckpt.get('ema_decay', ckpt_args.get('ema_decay', 'unknown'))}")
+    lines.append(f"split: {args.split} | device: {device}")
+    lines.append(f"参数量: {n_params:,} ({n_params / 1e6:.2f}M)")
+    lines.append(f"推理耗时: {per_img_ms:.2f} ms/张切片")
+    lines.append(f"峰值 GPU 显存: {peak_mem:.1f} MB")
+    print_level("Image 级（每张切片单独预测）", img_m, lines)
+    print_level("Scan 级（同扫描切片概率取平均）", scan_m, lines)
+    print_level("Patient 级（同患者扫描概率再平均）", pat_m, lines)
 
-    model = build_model(model_name=args.model, num_classes=2)
-    select_best_checkpoint(
-        model=model,
-        device=device,
-        model_name=args.model,
-        output_dir=model_output_dir,
-    )
-
-    if args.split in {"validation", "both"}:
-        evaluate_split(
-            model=model,
-            loader=validation_loader,
-            split_name="validation",
-            device=device,
-            output_dir=model_output_dir,
-        )
-
-    if args.split in {"test", "both"}:
-        evaluate_split(
-            model=model,
-            loader=test_loader,
-            split_name="test",
-            device=device,
-            output_dir=model_output_dir,
-        )
-
-    save_result_figures(model_output_dir)
+    report = "\n".join(lines)
+    print(report)
+    with open(os.path.join(out_dir, "eval_report.txt"), "w") as f:
+        f.write(report)
+    with open(os.path.join(out_dir, "eval_report.json"), "w") as f:
+        json.dump({
+            "image_level": img_m,
+            "scan_level": scan_m,
+            "patient_level": pat_m,
+            "resources": {
+                "parameters": n_params,
+                "inference_ms_per_image": per_img_ms,
+                "peak_gpu_memory_mb": peak_mem,
+                "device": device,
+                "n_images": len(rec),
+                "n_scans": rec["scan_id"].nunique(),
+                "n_patients": rec["patient_id"].nunique(),
+            },
+            "weight_source": weight_source,
+            "ema_decay": ckpt.get("ema_decay", ckpt_args.get("ema_decay")),
+        }, f, indent=2)
+    rec.to_csv(os.path.join(out_dir, f"predictions_{args.split}.csv"), index=False)
+    print(f"\n报告已保存至 {out_dir}/eval_report.txt / .json，"
+          f"切片级预测见 predictions_{args.split}.csv")
 
 
 if __name__ == "__main__":
