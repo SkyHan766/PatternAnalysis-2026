@@ -1,6 +1,5 @@
-# 基于 ConvNeXt 的 ADNI 脑部 MRI 分类探索
-
-**COMP3710 Pattern Recognition 项目报告（中文版）**  
+# 基于 ConvNeXt 的 ADNI 脑部 MRI 分类任务
+ 
 作者：Jinqiao Han　｜　日期：2026 年 10 月 27 日
 
 ## 报告概述
