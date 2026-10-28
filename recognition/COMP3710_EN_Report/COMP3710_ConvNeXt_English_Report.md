@@ -1,6 +1,5 @@
 # Exploring ADNI Brain MRI Classification with ConvNeXt
-
-**COMP3710 Pattern Recognition Project Report (English Version)**  
+ 
 Author: Jinqiao Han　｜　Date: 27 October 2026
 
 ## Report Overview
