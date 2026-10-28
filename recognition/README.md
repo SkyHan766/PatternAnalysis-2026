@@ -14,7 +14,7 @@ I have conducted up to 30 versions of experiments in Google Colab., the highest 
 
 The report selects three experiments that did not meet the image-level target as failure cases, rather than treating them as worthless. The focus is on why each change was made, what problem it was intended to address, what was actually observed, and what was learned. Data splits, training durations, and model sizes varied across stages, so the comparisons below describe the exploratory process rather than establish strict, single-factor causal conclusions.
 
-## Overview of the Methods Used in This Report (Terminology)
+## Overview of the Methods Used in This Report
 
 The following terms describe the experiments across the report; not every method was used in the final version.
 
