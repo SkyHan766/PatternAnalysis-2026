@@ -1,6 +1,5 @@
 # Exploring ADNI Brain MRI Classification with ConvNeXt
-
-**COMP3710 Pattern Recognition Project Report (English Version)**  
+ 
 Author: Jinqiao Han　｜　Date: 27 October 2026
 
 ## Report Overview
@@ -31,7 +30,6 @@ For ease of reference, the methods and terminology used in this report are expla
 
 **Reading guide:** Part I analyzes two cases with patient-level accuracy above 80%; Part II explains the data and training methods of the final version; and Part III analyzes the final results and potential improvements. The appendices provide result figures for the two cases, actual misclassified MRI slices, and training trends for the final version. The main text is organized into three parts. Markdown itself has no fixed paper pagination; when transferring the report to Word, the suggested page-break markers below can guide the layout.
 
-<!-- Suggested page break: end of cover; start of main text, page 1 -->
 
 ## I. Exploration and Two Failure Cases with Partial Achievements
 
@@ -59,7 +57,6 @@ This case retained the 70%/15%/15% patient split, light augmentation, and stocha
 
 **Figure 2 shows that, despite overall patient-level accuracy exceeding 80%, 12 AD patients were still classified as NC; Figure 3 further presents two high-confidence slice-level errors made by this model.** By epoch 50, training accuracy had reached 98.12%, while validation accuracy was 74.47%. This indicates that reducing model size did not eliminate overfitting. A single slice may also lack sufficient disease information, so a patient-level label should not be assumed to be equally easy to recognize in every slice.
 
-<!-- Suggested page break: start of main text, page 2 -->
 
 ## II. Failure Case Three and the Final Version: 77.40% Image-Level Validation Accuracy
 
@@ -93,7 +90,6 @@ After training in each epoch, the validation set was evaluated, and the best wei
 
 **Version boundary: the 77.40% version used neither brightness/contrast jitter nor EMA.** A later run with jitter achieved 76.92% image-level validation accuracy. In another run with EMA=0.999, the highest logged validation balanced accuracy was 76.85%, so that version was not adopted.
 
-<!-- Suggested page break: start of main text, page 3 -->
 
 ## III. Final Results, Reasons for Limited Gains, and Directions for Improvement
 
@@ -127,7 +123,6 @@ For training, patient- or scan-balanced sampling could be tried to reduce the di
 
 My main achievement in this project was establishing a complete workflow for training, model selection, multi-level evaluation, and failure analysis, and understanding that "better fitting of the training set," "patient-level aggregation above 80%," and "meeting the single-slice generalization target" are different goals.
 
-<!-- Suggested page break: end of main text; start of figure appendices, page 1 -->
 
 ## Figure Appendix A: Two Failure Cases with Patient-Level Accuracy Above 80%
 
@@ -143,7 +138,6 @@ My main achievement in this project was establishing a complete workflow for tra
 
 **How to read the figure:** This model uses a threshold of 0.5 at all three levels. Its image-level test accuracy is 76.02%, and its patient-level accuracy is 80.39%. In the patient confusion matrix, 61 NC patients and 21 AD patients are correctly classified, while 12 AD patients are misclassified as NC. The patient data contain 69 NC patients and 33 AD patients, so AD recall must be examined alongside overall accuracy.
 
-<!-- Suggested page break: start of figure appendices, page 2 -->
 
 ## Figure Appendix B: Actual Misclassified Slices and Trends in the Final Version
 
