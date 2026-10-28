@@ -110,9 +110,8 @@ By epoch 50, training accuracy had reached 98.12%, while validation accuracy was
 ![A false-positive normal slice and a false-negative AD slice](images/case2_mri_errors.png)
 
 **Figure 4. Two High-Confidence Slice-Level Errors from Case Two.**
-
 Left: patient 023_S_1190, slice 1251421_104.jpeg, actual NC, predicted AD, P(AD)=0.9998. Right: patient 127_S_5028, slice 375181_98.jpeg, actual AD, predicted NC, P(AD)<0.0001. These are slice-level errors, but they do not mean that the aggregated predictions for the two patients must also be incorrect. High confidence does not equate to correctness, and merely relying on these images cannot prove that a certain brain region or atrophy feature caused the error.
----
+
 
 ## II. Failure Case Three and the Final Version: 77.40% Image-Level Validation Accuracy
 
@@ -163,7 +162,6 @@ The supplied code revision uses the reported configuration by default: one input
 `train.py` evaluates the validation set after each epoch and selects the highest image-level balanced accuracy; ties replace the previous checkpoint. It does not select checkpoints using test results. `predict.py` loads the selected weights, uses `model.eval()` and deterministic preprocessing, and applies a threshold of 0.5. It averages slice probabilities separately by scan and by patient; it does not perform a second, equal-weight average over scans.
 
 
----
 
 ## III. Final Results, Reasons for Limited Gains, and Directions for Improvement
 
