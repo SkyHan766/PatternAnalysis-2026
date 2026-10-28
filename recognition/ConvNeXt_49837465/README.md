@@ -176,7 +176,7 @@ For the project manager, retain narrow ConvNeXt as a compact research prototype 
 
 The selected epoch-21 narrow ConvNeXt achieved **77.40% image validation accuracy and 73.04% image test accuracy**, with test macro-F1=0.7303 and ROC-AUC=0.8153. Its 3,178,018 parameters substantially reduce model size, but test accuracy remains **6.96 percentage points below the 80% requirement**.
 
-The verification accuracy is numerically higher than that of the earlier CNN by 75.88%. This project has established a complete zero-training classification process and discovered persistent generalization and confidence limitations. The early patient-level exceeding 80% is a useful supplementary result, which can indirectly indicate that ConvNeXt has certain advantages.
+Verification accuracy is numerically higher than the early CNN's 75.88%. This project has established a complete zero-training classification process and discovered persistent generalization and confidence limitations. The early patient-level exceeding 80% is a useful supplementary result, which can indirectly indicate that ConvNeXt has certain advantages.
 
 ## Artificial Intelligence Usage Disclosure
 
