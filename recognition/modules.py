@@ -1,11 +1,9 @@
 """
-modules.py — Narrow ConvNeXt 分类模型 (NC vs AD)
+Narrow ConvNeXt for AD/NC classification.
 
-架构与项目文档一致：
-- 单通道 224x224 灰度 MRI 切片输入
-- dims = [32, 64, 128, 256], depths = [3, 3, 9, 3] (共 18 个 ConvNeXt block)
-- DropPath 概率从 0 线性递增到 0.2
-- 参数量约 318 万，无预训练权重
+Single-channel 224x224 input; widths 32/64/128/256; depths 3/3/9/3.
+DropPath increases from 0 to 0.2 across 18 blocks.
+Default model: 3,178,018 parameters, trained from scratch.
 """
 import torch
 import torch.nn as nn
@@ -13,10 +11,10 @@ import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------- #
-# 辅助层
+# Helper layers
 # --------------------------------------------------------------------------- #
 class LayerNorm(nn.Module):
-    """支持 channels_first / channels_last 两种数据格式的 LayerNorm。"""
+    """LayerNorm for channels-first or channels-last tensors."""
 
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
         super().__init__()
@@ -33,7 +31,7 @@ class LayerNorm(nn.Module):
             return F.layer_norm(
                 x, self.normalized_shape, self.weight, self.bias, self.eps
             )
-        # channels_first: 手工在通道维上做 layer norm
+        # channels_first: Normalize along the channel dimension.
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
@@ -41,7 +39,7 @@ class LayerNorm(nn.Module):
 
 
 class DropPath(nn.Module):
-    """Stochastic depth (DropPath)，训练时按概率随机丢弃整个残差分支。"""
+    """Drop entire residual branches randomly during training."""
 
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -81,10 +79,10 @@ class ConvNeXtBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# 窄版 ConvNeXt（保留 Tiny 的 block 数，缩小通道宽度）
+# Narrow ConvNeXt: Tiny block counts with reduced channel widths
 # --------------------------------------------------------------------------- #
 class ConvNeXtNarrow(nn.Module):
-    """Narrow ConvNeXt / 窄版 ConvNeXt，用于 AD vs NC 的 MRI 切片分类。"""
+    """Narrow ConvNeXt for single-slice AD/NC classification."""
 
     def __init__(
         self,
@@ -99,21 +97,21 @@ class ConvNeXtNarrow(nn.Module):
         self.dims = dims
         self.depths = list(depths)
 
-        # Stem：1 -> 32，224x224 -> 56x56
+        # Stem: 1 -> 32 channels, 224x224 -> 56x56
         self.downsample_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_channels, dims[0], kernel_size=4, stride=4),
                 LayerNorm(dims[0], data_format="channels_first"),
             )
         ])
-        # 三次下采样：通道翻倍，空间尺寸减半
+        # Three downsamplers: double channels and halve spatial size.
         for i in range(3):
             self.downsample_layers.append(nn.Sequential(
                 LayerNorm(dims[i], data_format="channels_first"),
                 nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2),
             ))
 
-        # 18 个 block 的 DropPath 概率从 0 递增至 drop_path_rate
+        # Linearly increase DropPath across all 18 blocks.
         rates = torch.linspace(0, drop_path_rate, sum(depths)).tolist()
         self.stages = nn.ModuleList()
         offset = 0
@@ -133,7 +131,7 @@ class ConvNeXtNarrow(nn.Module):
 
     def forward(self, x):
         x = self.forward_features(x)
-        # 全局平均池化 -> LayerNorm -> 分类
+        # Global average pooling -> LayerNorm -> classification
         return self.head(self.norm(x.mean(dim=(-2, -1))))
 
     def num_parameters(self):
@@ -141,14 +139,14 @@ class ConvNeXtNarrow(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# 便捷构造函数
+# Model factory
 # --------------------------------------------------------------------------- #
 CLASS_TO_INDEX = {"NC": 0, "AD": 1}
 INDEX_TO_CLASS = {0: "NC", 1: "AD"}
 
 
 def build_model(**kwargs):
-    """按默认配置（318 万参数）构建模型。"""
+    """Build the default model with approximately 3.18M parameters."""
     model = ConvNeXtNarrow(**kwargs)
     return model
 
@@ -156,7 +154,7 @@ def build_model(**kwargs):
 if __name__ == "__main__":
     m = build_model()
     n = m.num_parameters()
-    print(f"参数量: {n:,} ({n / 1e6:.2f}M)")
+    print(f"Parameters: {n:,} ({n / 1e6:.2f}M)")
     x = torch.randn(2, 1, 224, 224)
     y = m(x)
-    print(f"输入 {tuple(x.shape)} -> 输出 {tuple(y.shape)}")
+    print(f"Input {tuple(x.shape)} -> output {tuple(y.shape)}")

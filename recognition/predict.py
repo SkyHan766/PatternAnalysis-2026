@@ -1,18 +1,12 @@
 """
-predict.py — 在 test 集上评估训练好的 Narrow ConvNeXt
+Evaluate a trained narrow ConvNeXt on train, validation, or test data.
 
-输出（控制台 + out_dir/eval_report.json + eval_report.txt）：
-1) 三个层级的 9 项性能指标，各配混淆矩阵与样本数：
-   - Image  级：每张切片单独预测
-   - Scan   级：同一扫描的切片 AD 概率取平均
-   - Patient级：同一患者的扫描 AD 概率再取平均
-   指标：Accuracy, Balanced accuracy, NC precision, NC recall,
-        AD precision, AD recall, Macro-F1, AD F1, ROC-AUC
-2) 资源统计：参数量、推理耗时（每张切片）、峰值 GPU 显存。
+Report nine metrics, confusion matrices, sample counts, and GPU resources.
+Scan and patient results average slice AD probabilities within each group.
+Save eval_report.txt, eval_report.json, and predictions_<split>.csv.
 
-用法：
-  python predict.py --checkpoint checkpoints/best_model.pth \
-      --manifest checkpoints/manifest.csv --split test
+Example:
+  python predict.py --checkpoint checkpoints/best_model.pth --split test
 """
 import os
 import json
@@ -33,10 +27,10 @@ from sklearn.metrics import (
 
 
 # --------------------------------------------------------------------------- #
-# 指标计算：9 项
+# Compute nine evaluation metrics
 # --------------------------------------------------------------------------- #
 def compute_metrics(y_true, y_prob_ad):
-    """y_prob_ad: 预测为 AD 的概率 (n,)。"""
+    """y_prob_ad contains one AD probability per sample."""
     y_pred = (y_prob_ad >= 0.5).astype(int)
     y_true = np.asarray(y_true).astype(int)
 
@@ -50,7 +44,7 @@ def compute_metrics(y_true, y_prob_ad):
     ad_f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
     try:
         auc = roc_auc_score(y_true, y_prob_ad)
-    except ValueError:  # 单类别等退化情形
+    except ValueError:  # Undefined AUC, e.g. only one class is present.
         auc = float("nan")
 
     return {
@@ -64,13 +58,13 @@ def compute_metrics(y_true, y_prob_ad):
         "ad_f1": ad_f1,
         "roc_auc": auc,
         "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
-        # 行=真实 [NC, AD]，列=预测 [NC, AD]
+        # Rows: actual [NC, AD]; columns: predicted [NC, AD].
         "n_samples": len(y_true),
     }
 
 
 def aggregate_level(df, prob_col, key):
-    """按 key (scan_id / patient_id) 聚合：组内 AD 概率取平均后阈值 0.5。"""
+    """Average slice AD probabilities by scan or patient, then threshold at 0.5."""
     grp = df.groupby(key).agg(
         y_true=("y_true", "first"),
         prob=("prob_ad", "mean"),
@@ -79,7 +73,7 @@ def aggregate_level(df, prob_col, key):
 
 
 # --------------------------------------------------------------------------- #
-# 推理
+# Inference
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def infer(model, loader, device):
@@ -98,13 +92,13 @@ def infer(model, loader, device):
         if device == "cuda":
             torch.cuda.synchronize()
         total_time += time.time() - t0
-        p = torch.softmax(logits, dim=1)[:, 1]  # AD 概率
+        p = torch.softmax(logits, dim=1)[:, 1]  # AD probability
         probs.append(p.cpu().numpy())
         labels.append(y.numpy())
         n_imgs += x.size(0)
     probs = np.concatenate(probs)
     labels = np.concatenate(labels)
-    # 收集 meta（path/patient/scan）
+    # Collect path, patient, and scan metadata.
     for k in ("path", "patient_id", "scan_id"):
         metas.append(meta_list(loader, k))
     per_img_ms = total_time / max(n_imgs, 1) * 1000
@@ -114,13 +108,13 @@ def infer(model, loader, device):
 
 
 def meta_list(loader, key):
-    """从 Dataset 中取出全部 meta（按顺序）。DataLoader 默认不返回 dict 列表的批量，故直接索引 dataset。"""
+    """Read metadata in dataset order; inference uses shuffle=False."""
     ds = loader.dataset
     return [ds.df.iloc[i][key] for i in range(len(ds))]
 
 
 # --------------------------------------------------------------------------- #
-# 报告打印
+# Format the evaluation report
 # --------------------------------------------------------------------------- #
 METRIC_KEYS = [
     ("accuracy", "Accuracy"),
@@ -137,11 +131,11 @@ METRIC_KEYS = [
 
 def print_level(name, m, lines):
     lines.append(f"\n===== {name} =====")
-    lines.append(f"样本数: {m['n_samples']}")
+    lines.append(f"Samples: {m['n_samples']}")
     for k, label in METRIC_KEYS:
         lines.append(f"  {label:18s}: {m[k]:.4f}")
     cm = m["confusion_matrix"]
-    lines.append("  混淆矩阵 (行=真实 NC,AD; 列=预测 NC,AD):")
+    lines.append("  Confusion matrix (rows=actual NC,AD; columns=predicted NC,AD):")
     lines.append(f"    NC: {cm[0]}")
     lines.append(f"    AD: {cm[1]}")
 
@@ -149,20 +143,20 @@ def print_level(name, m, lines):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--manifest", default=None, help="默认读取 checkpoint 同目录的 manifest.csv")
+    ap.add_argument("--manifest", default=None, help="Defaults to manifest.csv beside the checkpoint.")
     ap.add_argument("--data_root", default=None)
     ap.add_argument("--zip_path", default=None)
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--out_dir", "--output_dir", dest="out_dir", default=None, help="报告输出目录，默认取 checkpoint 目录")
+    ap.add_argument("--out_dir", "--output_dir", dest="out_dir", default=None, help="Output directory; defaults to the checkpoint directory.")
     args = ap.parse_args()
 
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.checkpoint))
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ---------------- 模型 ----------------
+    # ---------------- Model ----------------
     ckpt = torch.load(args.checkpoint, map_location=device)
     ckpt_args = ckpt.get("args", {})
     model = ConvNeXtNarrow(
@@ -180,7 +174,7 @@ def main():
     model.load_state_dict(inference_state_dict)
     n_params = model.num_parameters()
 
-    # ---------------- 数据 ----------------
+    # ---------------- Data ----------------
     data_root = ensure_data_root(
         args.data_root or ckpt_args.get("data_root", DEFAULT_DATA_ROOT),
         args.zip_path or ckpt_args.get("zip_path", DEFAULT_ZIP_PATH),
@@ -190,12 +184,12 @@ def main():
     df = load_manifest(args.manifest, data_root=data_root)
     df = df[df["split"] == args.split].reset_index(drop=True)
     if df.empty:
-        raise RuntimeError(f"manifest 中没有 split={args.split} 的样本")
+        raise RuntimeError(f"No samples with split={args.split} in the manifest.")
     ds = ADNISliceDataset(df, img_size=ckpt_args.get("img_size", 224), train=False)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, pin_memory=True)
 
-    # ---------------- 推理 ----------------
+    # ---------------- Inference ----------------
     probs, labels, (paths, pids, sids), per_img_ms, peak_mem = infer(
         model, loader, device
     )
@@ -206,7 +200,7 @@ def main():
         "y_true": labels, "prob_ad": probs,
     })
 
-    # ---------------- 三个层级指标 ----------------
+    # ---------------- Metrics at three evaluation levels ----------------
     img_m = compute_metrics(rec["y_true"].values, rec["prob_ad"].values)
     scan_m = aggregate_level(rec, "prob_ad", "scan_id")
     pat_m = aggregate_level(rec, "prob_ad", "patient_id")
@@ -217,12 +211,12 @@ def main():
     if weight_source == "ema":
         lines.append(f"EMA decay: {ckpt.get('ema_decay', ckpt_args.get('ema_decay', 'unknown'))}")
     lines.append(f"split: {args.split} | device: {device}")
-    lines.append(f"参数量: {n_params:,} ({n_params / 1e6:.2f}M)")
-    lines.append(f"推理耗时: {per_img_ms:.2f} ms/张切片")
-    lines.append(f"峰值 GPU 显存: {peak_mem:.1f} MB")
-    print_level("Image 级（每张切片单独预测）", img_m, lines)
-    print_level("Scan 级（同扫描切片概率取平均）", scan_m, lines)
-    print_level("Patient 级（同患者扫描概率再平均）", pat_m, lines)
+    lines.append(f"Parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
+    lines.append(f"Inference time: {per_img_ms:.2f} ms/slices")
+    lines.append(f"Peak allocated GPU memory: {peak_mem:.1f} MB")
+    print_level("Image level (individual slices)", img_m, lines)
+    print_level("Scan level (mean slice probability per scan)", scan_m, lines)
+    print_level("Patient level (mean slice probability per patient)", pat_m, lines)
 
     report = "\n".join(lines)
     print(report)
@@ -246,8 +240,8 @@ def main():
             "ema_decay": ckpt.get("ema_decay", ckpt_args.get("ema_decay")),
         }, f, indent=2)
     rec.to_csv(os.path.join(out_dir, f"predictions_{args.split}.csv"), index=False)
-    print(f"\n报告已保存至 {out_dir}/eval_report.txt / .json，"
-          f"切片级预测见 predictions_{args.split}.csv")
+    print(f"\nReports saved to {out_dir}/eval_report.txt / .json，"
+          f"Slice predictions: predictions_{args.split}.csv")
 
 
 if __name__ == "__main__":

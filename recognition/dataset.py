@@ -1,19 +1,10 @@
 """
-dataset.py — ADNI MRI 切片数据集与患者级安全划分
+ADNI MRI slices with patient-disjoint, class-stratified splits.
 
-数据说明（学校 ADNI 包，/home/groups/comp3710/ADNI）：
-- 预处理后的结构 MRI 切片，AD / CN 两类（代码中 NC 与 CN 同义）
-- 原始 Train/Test 文件夹划分存在 216 名患者重叠，不满足患者隔离要求，
-  因此本模块提供按患者（patient）为单位重新划分的能力。
-- 若已有一份 manifest csv（含 path/label/patient_id/scan_id/split 字段），
-  可直接加载使用。
-
-manifest 约定字段：
-  path        图像文件的绝对或相对路径
-  label       'NC' 或 'AD'
-  patient_id  患者唯一编号（同一患者所有扫描/切片共享）
-  scan_id     扫描唯一编号（同一次扫描的所有切片共享，介于患者与切片之间）
-  split       'train' / 'val' / 'test'
+Load an existing manifest or regroup the course folders by patient.
+Required columns: path, label (NC/AD), patient_id, scan_id, split.
+All scans and slices from one patient remain in the same subset.
+Default patient proportions: 70% train, 10% validation, 20% test.
 """
 import os
 import json
@@ -29,21 +20,21 @@ from torch.utils.data import Dataset
 
 try:
     from torchvision import transforms
-except ImportError:  # 无 torchvision 时的最小 fallback
+except ImportError:  # Minimal fallback when torchvision is unavailable.
     transforms = None
 
 
-# 与之前 Colab 代码一致的压缩包、解压及结果目录。
+# Colab archive, extraction, and output paths.
 DEFAULT_ZIP_PATH = "/content/drive/MyDrive/COMP3710/Final_Project_dataset/ADNI.zip"
 DEFAULT_DATA_ROOT = "/content/comp3710_adni/ADNI"
 DEFAULT_OUTPUT_DIR = (
     "/content/drive/MyDrive/COMP3710/Final_Project_dataset/convnext_results_4/"
-    "convnext_narrow_b64_fromkimi"
+    "convnext_narrow_final7740_reproduction"
 )
 
 
 def ensure_data_root(data_root=DEFAULT_DATA_ROOT, zip_path=DEFAULT_ZIP_PATH):
-    """复用已解压数据；缺失时将学校 ADNI.zip 解压至数据根目录的父目录。"""
+    """Reuse extracted data, or extract ADNI.zip into the parent directory."""
     root = Path(data_root).expanduser().resolve()
     image_root = root / "AD_NC" if (root / "AD_NC").is_dir() else root
     metadata_candidates = [root / "meta_data_with_label.json",
@@ -60,13 +51,13 @@ def ensure_data_root(data_root=DEFAULT_DATA_ROOT, zip_path=DEFAULT_ZIP_PATH):
             archive = alternative
     if not archive.is_file():
         raise FileNotFoundError(
-            f"数据目录不完整：{root}；压缩包不存在：{archive}。"
-            "请先挂载 Google Drive，或通过 --zip_path 指定压缩包。"
+            f"Incomplete dataset: {root}; archive not found: {archive}. "
+            "Mount Google Drive or specify the archive with --zip_path."
         )
-    # 学校压缩包内包含 ADNI/AD_NC 和 ADNI/meta_data_with_label.json。
+    # The course archive contains ADNI/AD_NC and its metadata JSON.
     if root.name != "ADNI":
         raise FileNotFoundError(
-            f"自定义数据目录尚未准备好：{root}。自动解压要求 data_root 末尾为 ADNI。"
+            f"Custom data directory is not ready: {root}. Automatic extraction requires a root named ADNI."
         )
     destination = root.parent
     destination.mkdir(parents=True, exist_ok=True)
@@ -79,56 +70,49 @@ def ensure_data_root(data_root=DEFAULT_DATA_ROOT, zip_path=DEFAULT_ZIP_PATH):
     if not ((root / "AD_NC" / "train").is_dir()
             and (root / "AD_NC" / "test").is_dir()
             and (root / "meta_data_with_label.json").is_file()):
-        raise FileNotFoundError(f"解压后未找到预期的 AD_NC 和 metadata：{root}")
+        raise FileNotFoundError(f"Expected AD_NC folder or metadata missing after extraction: {root}")
     print(f"Dataset extracted: {root}")
     return str(root)
 
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".npy")
 
-# ADNI 文件名中常见的患者编号格式，例如 006_S_4153 / 037_S_4430
+# ADNI subject ID format, e.g. 006_S_4153 or 037_S_4430.
 _ADNI_SUBJECT_RE = re.compile(r"(\d{3}_S_\d{4})")
 
 
 # --------------------------------------------------------------------------- #
-# 从文件名解析患者 / 扫描编号
+# Parse patient and scan IDs from filenames
 # --------------------------------------------------------------------------- #
 def parse_patient_scan_id(filename, metadata=None):
-    """
-    从 ADNI 切片文件名解析 (patient_id, scan_id)。
-    兼容形如 '006_S_4153_MR_..._br_raw_xxx.png' 的命名：
-      - patient_id = ADNI 受试者编号 (e.g. 006_S_4153)
-      - scan_id    = 受试者编号 + 文件名中扫描/序列相关的前缀字段
-    学校的数字文件名（如 1003730_100.jpeg）通过 metadata 映射患者。
-    无法确定患者时直接报错，不能把每张切片当成独立患者。
-    """
+    """Resolve patient/scan IDs; numeric filenames require metadata."""
     stem = os.path.splitext(os.path.basename(filename))[0]
     short = re.fullmatch(r"(\d+)_(\d+)", stem)
     if short:
         scan_id = short.group(1)
         record = (metadata or {}).get(scan_id)
         if not isinstance(record, dict):
-            raise ValueError(f"扫描 {scan_id} 缺少 metadata，无法确定患者编号。")
+            raise ValueError(f"Missing metadata for scan {scan_id}; cannot resolve the patient.")
         subjects = {
             match.group(1)
             for value in record.values() if isinstance(value, str)
             for match in _ADNI_SUBJECT_RE.finditer(value)
         }
         if len(subjects) != 1:
-            raise ValueError(f"扫描 {scan_id} 的患者编号缺失或不一致：{subjects}")
+            raise ValueError(f"Missing or ambiguous patient ID for scan {scan_id}: {subjects}")
         return subjects.pop(), scan_id
     m = _ADNI_SUBJECT_RE.search(stem)
     if m:
         patient_id = m.group(1)
         rest = stem[m.end():].lstrip("_").split("_")
-        scan_tokens = [t for t in rest if t][:4]  # 取扫描相关的前几个字段
+        scan_tokens = [t for t in rest if t][:4]  # Use the leading scan-related fields.
         scan_id = "_".join([patient_id] + scan_tokens) if scan_tokens else patient_id
         return patient_id, scan_id
-    raise ValueError(f"无法从文件名确定患者/扫描编号：{filename}")
+    raise ValueError(f"Cannot resolve patient/scan IDs from filename: {filename}")
 
 
 # --------------------------------------------------------------------------- #
-# 扫描磁盘构建 manifest，并按患者重新划分 train/val/test
+# Build a manifest and assign patient-disjoint subsets
 # --------------------------------------------------------------------------- #
 def build_manifest(
     data_root,
@@ -139,20 +123,7 @@ def build_manifest(
     folder_split=True,
     metadata_path=None,
 ):
-    """
-    扫描 data_root 下所有图像，生成含患者/扫描/划分信息的 manifest。
-
-    folder_split=True  （默认）期望目录结构为
-        data_root/{train,test}/{AD,CN|NC}/xxx.png
-        此时所有文件先纳入统计，再按患者重新划分，避免患者泄漏。
-    folder_split=False 期望目录结构为 data_root/{AD,CN}/xxx.png。
-    也支持 data_root/AD_NC/{train,test}/{AD,NC}/xxx.jpeg。
-    数字文件名使用 meta_data_with_label.json 映射患者；可传入 metadata_path，
-    默认在 data_root 或其父目录寻找该文件。
-
-    划分方式：按患者分组、按标签分层，随机打乱后按比例切分，
-    保证同一患者的所有切片只出现在一个 split 中。
-    """
+    """Scan the course folders and stratify patients into train/val/test."""
     data_root = os.path.abspath(data_root)
     if os.path.isdir(os.path.join(data_root, "AD_NC")):
         data_root = os.path.join(data_root, "AD_NC")
@@ -196,17 +167,17 @@ def build_manifest(
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise RuntimeError(f"在 {data_root} 下未找到任何图像，请检查路径与目录结构。")
+        raise RuntimeError(f"No images found in {data_root}; check the path and folder structure.")
 
-    # ---- 按患者重新划分（患者隔离，训练/测试无重叠） ----
-    # 必须在去重前检查，否则 drop_duplicates 会隐藏标签冲突。
+    # ---- Regroup by patient to prevent overlap between subsets ----
+    # Check label conflicts before deduplication can hide them.
     if (df.groupby("patient_id")["label"].nunique() > 1).any():
-        raise ValueError("同一患者出现不同类别标签，请检查数据。")
+        raise ValueError("Conflicting class labels for the same patient.")
     rng = random.Random(seed)
     patients = (df[["patient_id", "label"]]
                 .drop_duplicates("patient_id")
                 .reset_index(drop=True))
-    # 同一患者只应有一个标签
+    # Each patient must have exactly one label.
     assert patients["patient_id"].is_unique
 
     assign = {}
@@ -227,8 +198,8 @@ def build_manifest(
     df["split"] = df["patient_id"].map(assign)
     if out_csv:
         df.to_csv(out_csv, index=False)
-        print(f"manifest 已保存至 {out_csv}，共 {len(df)} 张切片，"
-              f"{df['patient_id'].nunique()} 名患者。")
+        print(f"Manifest saved to {out_csv}: {len(df)} slices, "
+              f"{df['patient_id'].nunique()} patients.")
     return df
 
 
@@ -237,9 +208,9 @@ def load_manifest(csv_path, data_root=None):
     need = {"path", "label", "patient_id", "scan_id", "split"}
     missing = need - set(df.columns)
     if missing:
-        raise ValueError(f"manifest 缺少字段: {missing}")
+        raise ValueError(f"Missing manifest columns: {missing}")
     df["label"] = df["label"].replace({"CN": "NC"})
-    # 仅适配图片路径，不改变标签、患者或 split。
+    # Resolve image paths without changing labels, patients, or splits.
     def resolve_image_path(value):
         path = Path(value)
         if path.is_file():
@@ -258,13 +229,13 @@ def load_manifest(csv_path, data_root=None):
         candidate = Path(csv_path).resolve().parent / path
         if candidate.is_file():
             return str(candidate)
-        raise FileNotFoundError(f"manifest 中的图片不存在：{value}")
+        raise FileNotFoundError(f"Image in manifest not found: {value}")
     df["path"] = df["path"].map(resolve_image_path)
     return df
 
 
 # --------------------------------------------------------------------------- #
-# 图像读取
+# Image loading
 # --------------------------------------------------------------------------- #
 def load_image(path):
     if path.lower().endswith(".npy"):
@@ -274,7 +245,7 @@ def load_image(path):
             arr = arr[None, ...]  # HW -> 1HW
         return torch.from_numpy(arr).float()
     with Image.open(path) as im:
-        im = im.convert("L")  # 灰度
+        im = im.convert("L")  # Grayscale
         arr = torch.from_numpy(
             __import__("numpy").array(im, dtype="float32") / 255.0
         )
@@ -284,8 +255,8 @@ def load_image(path):
 # --------------------------------------------------------------------------- #
 # Dataset
 # --------------------------------------------------------------------------- #
-def build_transform(img_size=224, train=True):
-    """训练/验证共用预处理；训练时加入轻度数据增强。"""
+def build_transform(img_size=224, train=True, jitter=0.0):
+    """Shared preprocessing; apply light augmentation only during training."""
 
     if transforms is not None:
         ops = [
@@ -301,11 +272,11 @@ def build_transform(img_size=224, train=True):
                     translate=(0.05, 0.05),
                 ),
 
-                transforms.ColorJitter(
-                    brightness=0.1,
-                    contrast=0.1,
-                ),
             ]
+
+        # Jitter belongs to a later experiment, not the final report model.
+        if train and jitter > 0:
+            ops.append(transforms.ColorJitter(brightness=jitter, contrast=jitter))
 
         ops += [
             transforms.ToTensor(),
@@ -318,7 +289,7 @@ def build_transform(img_size=224, train=True):
 
         return transforms.Compose(ops)
 
-    # 没有 torchvision 时的备用处理
+    # Fallback preprocessing without torchvision.
     def _tf(img):
         x = load_image(img)
 
@@ -335,11 +306,11 @@ def build_transform(img_size=224, train=True):
 
 
 class ADNISliceDataset(Dataset):
-    """返回 (image_tensor, label, meta_dict)。meta 含 path/patient/scan，供评估聚合。"""
+    """Return image, label, and path/patient/scan metadata for evaluation."""
 
-    def __init__(self, dataframe, img_size=224, train=True):
+    def __init__(self, dataframe, img_size=224, train=True, jitter=0.0):
         self.df = dataframe.reset_index(drop=True)
-        self.tf = build_transform(img_size, train=train)
+        self.tf = build_transform(img_size, train=train, jitter=jitter)
 
     def __len__(self):
         return len(self.df)
@@ -361,22 +332,22 @@ class ADNISliceDataset(Dataset):
 
 
 def split_dataframe(df):
-    """返回 train/val/test 三个子集 DataFrame。"""
+    """Return train, validation, and test DataFrames."""
     out = {}
     for s in ("train", "val", "test"):
         sub = df[df["split"] == s]
         out[s] = sub.reset_index(drop=True)
-        print(f"split={s:5s}: {len(sub):6d} 张切片, "
-              f"{sub['scan_id'].nunique():4d} 次扫描, "
-              f"{sub['patient_id'].nunique():4d} 名患者")
-    # 患者隔离检查
+        print(f"split={s:5s}: {len(sub):6d} slices, "
+              f"{sub['scan_id'].nunique():4d} scans, "
+              f"{sub['patient_id'].nunique():4d} patients")
+    # Check patient isolation.
     tr = set(out["train"]["patient_id"]) | set(out["val"]["patient_id"])
     te = set(out["test"]["patient_id"])
     overlap = tr & te
-    print(f"train/val 与 test 的患者重叠数: {len(overlap)}（应为 0）")
+    print(f"Patient overlap between train/val and test: {len(overlap)} (expected 0)")
     if overlap or (set(out["train"]["patient_id"]) &
                    set(out["val"]["patient_id"])):
-        raise ValueError("train/val/test 之间存在患者重叠。")
+        raise ValueError("Patient overlap detected between train/val/test.")
     return out
 
 

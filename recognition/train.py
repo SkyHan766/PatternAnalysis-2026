@@ -1,15 +1,14 @@
 """
-train.py — 训练 Narrow ConvNeXt 进行 AD vs NC 分类
+Train narrow ConvNeXt for AD/NC classification.
 
-用法示例：
-  python train.py --data_root /content/comp3710_adni/ADNI \
-      --out_dir checkpoints --epochs 30 --batch_size 64 --lr 1e-3
+Defaults match the reported 77.40% validation experiment: 60 epochs,
+LR 3e-4, WD 0.05, batch size 64, no EMA, and no brightness/contrast jitter.
+Use --amp for the reported mixed-precision run and reuse its manifest.
+Optional --ema and --jitter reproduce later exploratory settings.
+Save best_model.pth by validation image-level balanced accuracy.
 
-若已有 manifest.csv（dataset.py 生成或提供）：
-  python train.py --manifest manifest.csv --out_dir checkpoints
-
-训练日志（loss、各 split 统计、患者重叠检查）写入 out_dir/train_log.txt，
-最佳模型按 val balanced accuracy 保存为 best_model.pth。
+Example:
+  python train.py --manifest manifest.csv --out_dir checkpoints --amp
 """
 import os
 import time
@@ -70,7 +69,7 @@ class ModelEMA:
 
 
 # --------------------------------------------------------------------------- #
-# 训练 / 验证循环
+# Training and validation loops
 # --------------------------------------------------------------------------- #
 def run_epoch(model, loader, criterion, optimizer, device, scaler=None, ema=None):
     model.train()
@@ -78,7 +77,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler=None, ema=None
     for x, y, _ in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad(set_to_none=True)
-        if scaler is not None:  # AMP 混合精度
+        if scaler is not None:  # AMP mixed precision
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(x)
                 loss = criterion(logits, y)
@@ -104,7 +103,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler=None, ema=None
 
 @torch.no_grad()
 def evaluate(model, loader, device):
-    """返回 (balanced_acc, acc)；用 NC/AD 两类召回率的平均值作为选模型指标。"""
+    """Return mean class recall (balanced accuracy) and ordinary accuracy."""
     model.eval()
     correct, total_n = 0, 0
     tp_ad = fp_ad = fn_ad = 0
@@ -126,8 +125,8 @@ def evaluate(model, loader, device):
                     tp_nc += 1
                 else:
                     fp_nc += 1
-    fp_ad = fp_nc  # 预测为AD但实际NC
-    fn_nc = fp_nc  # 实际为NC，但预测为AD
+    fp_ad = fp_nc  # Predicted AD, actual NC.
+    fn_nc = fp_nc  # Actual NC, predicted AD.
     rec_ad = tp_ad / (tp_ad + fn_ad) if (tp_ad + fn_ad) else 0.0
     rec_nc = tp_nc / (tp_nc + fn_nc) if (tp_nc + fn_nc) else 0.0
     balanced_acc = (rec_ad + rec_nc) / 2
@@ -139,18 +138,21 @@ def main():
     ap.add_argument("--data_root", default=DEFAULT_DATA_ROOT)
     ap.add_argument("--zip_path", default=DEFAULT_ZIP_PATH)
     ap.add_argument("--manifest", default=None,
-                    help="已有 manifest csv 路径；不提供则现场扫描生成")
+                    help="Existing manifest CSV; scan the dataset if omitted.")
     ap.add_argument("--out_dir", "--output_dir", dest="out_dir", default=DEFAULT_OUTPUT_DIR)
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=5e-2)
     ap.add_argument("--img_size", type=int, default=224)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--amp", action="store_true", help="启用混合精度训练")
+    ap.add_argument("--amp", action="store_true", help="Enable mixed-precision training.")
     ap.add_argument("--base_channels", type=int, default=32)
     ap.add_argument("--drop_path_rate", type=float, default=0.2)
+    ap.add_argument("--ema", action="store_true", help="Use EMA weights; off for the final report model.")
+    ap.add_argument("--jitter", type=float, default=0.0,
+                    help="Brightness/contrast strength; 0 disables jitter.")
     ap.add_argument(
         "--ema_decay",
         type=float,
@@ -164,14 +166,14 @@ def main():
     log_file = os.path.join(args.out_dir, "train_log.txt")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ---------------- 数据 ----------------
+    # ---------------- Data ----------------
     args.data_root = ensure_data_root(args.data_root, args.zip_path)
     if args.manifest:
         if not os.path.isfile(args.manifest):
-            raise FileNotFoundError(f"manifest 不存在：{args.manifest}")
+            raise FileNotFoundError(f"Manifest not found: {args.manifest}")
         df = load_manifest(args.manifest, data_root=args.data_root)
         df.to_csv(os.path.join(args.out_dir, "manifest.csv"), index=False)
-        log_msg(log_file, f"加载已有 manifest: {args.manifest}")
+        log_msg(log_file, f"Loaded existing manifest: {args.manifest}")
     else:
         df = build_manifest(
             args.data_root,
@@ -180,7 +182,7 @@ def main():
         )
     subsets = split_dataframe(df)
 
-    train_ds = ADNISliceDataset(subsets["train"], args.img_size, train=True)
+    train_ds = ADNISliceDataset(subsets["train"], args.img_size, train=True, jitter=args.jitter)
     val_ds = ADNISliceDataset(subsets["val"], args.img_size, train=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True,
@@ -188,17 +190,19 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # ---------------- 模型 / 优化器 ----------------
+    # ---------------- Model and optimizer ----------------
     model = ConvNeXtNarrow(
         in_channels=1, num_classes=2,
         base_channels=args.base_channels,
         depths=(3, 3, 9, 3),
         drop_path_rate=args.drop_path_rate,
     ).to(device)
-    ema = ModelEMA(model, decay=args.ema_decay)
-    log_msg(log_file, f"参数量: {model.num_parameters():,}")
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    log_msg(log_file, f"Parameters: {model.num_parameters():,}")
     log_msg(log_file, f"device: {device}")
-    log_msg(log_file, f"EMA decay: {args.ema_decay}")
+    log_msg(log_file, f"EMA: {args.ema}; decay: {args.ema_decay if args.ema else 'off'}")
+    log_msg(log_file, f"Brightness/contrast jitter: {args.jitter}")
+    log_msg(log_file, f"LR: {args.lr}; WD: {args.weight_decay}; epochs: {args.epochs}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.AdamW(
@@ -209,15 +213,16 @@ def main():
     )
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device == "cuda") else None
 
-    # ---------------- 训练循环 ----------------
+    # ---------------- Training loop ----------------
     best_bal_acc = 0.0
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_loss, train_acc = run_epoch(
             model, train_loader, criterion, optimizer, device, scaler, ema
         )
-        # Model selection and reported validation metrics use EMA weights.
-        val_bal_acc, val_acc = evaluate(ema.module, val_loader, device)
+        # The final report selects ordinary model weights; EMA is optional.
+        evaluation_model = ema.module if ema is not None else model
+        val_bal_acc, val_acc = evaluate(evaluation_model, val_loader, device)
         scheduler.step()
 
         msg = (f"epoch {epoch:3d}/{args.epochs} | "
@@ -231,21 +236,24 @@ def main():
 
         if val_bal_acc >= best_bal_acc:
             best_bal_acc = val_bal_acc
-            torch.save({
+            checkpoint = {
                 "epoch": epoch,
-                # Keep state_dict as EMA for backward compatibility with the
-                # existing predict.py checkpoint interface.
-                "state_dict": ema.module.state_dict(),
-                "ema_state_dict": ema.module.state_dict(),
-                "model_state_dict": model.state_dict(),
-                "weight_source": "ema",
-                "ema_decay": args.ema_decay,
+                "state_dict": evaluation_model.state_dict(),
+                "weight_source": "ema" if ema is not None else "model",
                 "val_bal_acc": val_bal_acc,
+                "val_acc": val_acc,
                 "args": vars(args),
-            }, os.path.join(args.out_dir, "best_model.pth"))
-            log_msg(log_file, f"  -> 保存最佳模型 (val_bal_acc={val_bal_acc:.4f})")
+            }
+            if ema is not None:
+                checkpoint.update({
+                    "ema_state_dict": ema.module.state_dict(),
+                    "model_state_dict": model.state_dict(),
+                    "ema_decay": args.ema_decay,
+                })
+            torch.save(checkpoint, os.path.join(args.out_dir, "best_model.pth"))
+            log_msg(log_file, f"  -> Saved best model (val_bal_acc={val_bal_acc:.4f})")
 
-    log_msg(log_file, f"训练完成，最佳 val_bal_acc = {best_bal_acc:.4f}")
+    log_msg(log_file, f"Training complete; best val_bal_acc = {best_bal_acc:.4f}")
 
 
 if __name__ == "__main__":
