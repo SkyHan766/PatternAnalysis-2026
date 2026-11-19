@@ -181,6 +181,7 @@ Verification accuracy is numerically higher than the early CNN's 75.88%. This pr
 ## Artificial Intelligence Usage Disclosure
 
 ChatGPT was used for code suggestions, debugging, organizing experimental ideas, and assistance with report writing and figure layout. Experimental results come from actual run records; optimizations not yet implemented are presented as suggestions.
+I verified AI-assisted code changes by running python -m py_compile dataset.py modules.py train.py predict.py and reviewing the changes manually. When a suggestion changed the model architecture, I also ran python modules.py as a smoke test to check the output shape and parameter count. I did not adopt suggestions that I considered too aggressive or unsuitable for the project. When the effect of a training change was uncertain, I tested it for a small number of epochs first and stopped if the validation results showed no clear benefit, limiting unnecessary compute time and cost.
 
 ## References
 
@@ -225,7 +226,20 @@ Left: `023_S_1190`, `1251421_104.jpeg`, actual NC, predicted AD, P(AD)=0.9998. R
 
 #### B.1.2 Dependencies and environment recording
 
-Required: Python, PyTorch, TorchVision, NumPy, pandas, Pillow and scikit-learn. For the plotting in Appendix C, Matplotlib is also needed.
+The following versions were recorded in the Google Colab environment used to check the submitted code:
+
+| Dependency | Version |
+|---|---|
+| Python | 3.13.16 |
+| PyTorch (`torch`) | 2.14.1+cu130 |
+| TorchVision | 0.29.1+cu130 |
+| NumPy | 2.4.6 |
+| pandas | 2.2.3 |
+| Pillow | 11.3.0 |
+| scikit-learn | 1.6.1 |
+| Matplotlib | 3.10.0 |
+
+Reproduction also requires the same code, patient-level manifest, dataset, and training settings. These environment versions were recorded for the current code check; the exact package versions used for the historical reported experiment were not preserved.
 
 #### B.1.3 Obtain the code and set paths
 

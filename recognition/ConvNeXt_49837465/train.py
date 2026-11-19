@@ -13,6 +13,7 @@ Example:
 import os
 import time
 import argparse
+import csv
 from copy import deepcopy
 import numpy as np
 
@@ -39,6 +40,53 @@ def log_msg(log_file, msg):
     print(msg)
     with open(log_file, "a") as f:
         f.write(msg + "\n")
+
+
+def save_training_outputs(history, out_dir):
+    """Save machine-readable history and update loss/metric curves."""
+    csv_path = os.path.join(out_dir, "training_history.csv")
+    fieldnames = [
+        "epoch", "train_loss", "val_loss", "train_acc", "val_acc",
+        "val_bal_acc", "lr", "epoch_seconds",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+    # Use a non-interactive backend so plotting also works on Colab/HPC.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = [row["epoch"] for row in history]
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(
+        epochs,
+        [row["train_loss"] for row in history],
+        label="Train loss (label smoothing)",
+    )
+    axes[0].plot(
+        epochs,
+        [row["val_loss"] for row in history],
+        label="Validation loss (hard targets)",
+    )
+    axes[0].set(xlabel="Epoch", ylabel="Cross-entropy loss", title="Loss")
+
+    axes[1].plot(epochs, [row["train_acc"] for row in history], label="Train accuracy")
+    axes[1].plot(epochs, [row["val_acc"] for row in history], label="Validation accuracy")
+    axes[1].plot(
+        epochs,
+        [row["val_bal_acc"] for row in history],
+        label="Validation balanced accuracy",
+    )
+    axes[1].set(xlabel="Epoch", ylabel="Score", ylim=(0.0, 1.0), title="Metrics")
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "training_curves.png"), dpi=200)
+    plt.close(fig)
 
 
 class ModelEMA:
@@ -102,16 +150,18 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler=None, ema=None
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
-    """Return mean class recall (balanced accuracy) and ordinary accuracy."""
+def evaluate(model, loader, criterion, device):
+    """Return validation loss, balanced accuracy, and ordinary accuracy."""
     model.eval()
-    correct, total_n = 0, 0
+    total_loss, correct, total_n = 0.0, 0, 0
     tp_ad = fp_ad = fn_ad = 0
     tp_nc = fp_nc = fn_nc = 0
     for x, y, _ in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
+        loss = criterion(logits, y)
         pred = logits.argmax(1)
+        total_loss += loss.item() * x.size(0)
         correct += (pred == y).sum().item()
         total_n += x.size(0)
         for p, t in zip(pred.tolist(), y.tolist()):
@@ -130,7 +180,11 @@ def evaluate(model, loader, device):
     rec_ad = tp_ad / (tp_ad + fn_ad) if (tp_ad + fn_ad) else 0.0
     rec_nc = tp_nc / (tp_nc + fn_nc) if (tp_nc + fn_nc) else 0.0
     balanced_acc = (rec_ad + rec_nc) / 2
-    return balanced_acc, correct / max(total_n, 1)
+    return (
+        total_loss / max(total_n, 1),
+        balanced_acc,
+        correct / max(total_n, 1),
+    )
 
 
 def main():
@@ -205,6 +259,9 @@ def main():
     log_msg(log_file, f"LR: {args.lr}; WD: {args.weight_decay}; epochs: {args.epochs}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Validation loss uses hard targets and does not affect training or
+    # checkpoint selection. This keeps it interpretable across experiments.
+    val_criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -215,6 +272,7 @@ def main():
 
     # ---------------- Training loop ----------------
     best_bal_acc = 0.0
+    history = []
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_loss, train_acc = run_epoch(
@@ -222,17 +280,35 @@ def main():
         )
         # The final report selects ordinary model weights; EMA is optional.
         evaluation_model = ema.module if ema is not None else model
-        val_bal_acc, val_acc = evaluate(evaluation_model, val_loader, device)
+        val_loss, val_bal_acc, val_acc = evaluate(
+            evaluation_model, val_loader, val_criterion, device
+        )
+        current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
+        epoch_seconds = time.time() - t0
 
         msg = (f"epoch {epoch:3d}/{args.epochs} | "
-               f"loss {train_loss:.4f} | "
+               f"train_loss {train_loss:.4f} | "
+               f"val_loss {val_loss:.4f} | "
                f"train_acc {train_acc:.4f} | "
                f"val_acc {val_acc:.4f} | "
                f"val_bal_acc {val_bal_acc:.4f} | "
-               f"lr {scheduler.get_last_lr()[0]:.2e} | "
-               f"{time.time() - t0:.1f}s")
+               f"lr {current_lr:.2e} | "
+               f"{epoch_seconds:.1f}s")
         log_msg(log_file, msg)
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_acc": train_acc,
+            "val_acc": val_acc,
+            "val_bal_acc": val_bal_acc,
+            "lr": current_lr,
+            "epoch_seconds": epoch_seconds,
+        })
+        # Update after every epoch so partial runs still retain their plots.
+        save_training_outputs(history, args.out_dir)
 
         if val_bal_acc >= best_bal_acc:
             best_bal_acc = val_bal_acc
@@ -240,6 +316,7 @@ def main():
                 "epoch": epoch,
                 "state_dict": evaluation_model.state_dict(),
                 "weight_source": "ema" if ema is not None else "model",
+                "val_loss": val_loss,
                 "val_bal_acc": val_bal_acc,
                 "val_acc": val_acc,
                 "args": vars(args),
