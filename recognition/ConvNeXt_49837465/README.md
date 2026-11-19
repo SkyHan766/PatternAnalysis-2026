@@ -1,6 +1,6 @@
 # ADNI Brain MRI Classification with Narrow ConvNeXt
 
-Author: Jinqiao Han | 28 October 2026
+Author: Jinqiao Han(49837465) | 28 October 2026
 
 ## 1. Project overview and working principles
 
